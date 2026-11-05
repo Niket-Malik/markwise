@@ -1,0 +1,16 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+SQLAlchemy==2.0.40
+alembic==1.15.2
+psycopg[binary]==3.2.6
+pydantic-settings==2.9.1
+python-dotenv==1.1.0
+python-multipart==0.0.20
+pypdf==5.4.0
+python-docx==1.1.2
+httpx==0.28.1
+pgvector==0.5.1
+Pillow==13.0.0
+pypdfium2==5.14.0
+pytesseract==0.3.13
+boto3>=1.37,<2

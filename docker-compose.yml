@@ -1,0 +1,54 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: markwise
+      POSTGRES_USER: markwise
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U markwise -d markwise"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://markwise:${POSTGRES_PASSWORD}@db:5432/markwise}
+    command: ["sh", "-c", "alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+    ports: ["8000:8000"]
+    volumes: ["./backend:/app", "./uploads:/app/uploads"]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  retention:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://markwise:${POSTGRES_PASSWORD}@db:5432/markwise}
+    volumes: ["./backend:/app", "./uploads:/app/uploads"]
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["sh", "-c", "while true; do python -m app.retention || echo 'Retention run failed; will retry'; sleep ${RETENTION_INTERVAL_SECONDS:-86400}; done"]
+    restart: unless-stopped
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on:
+      api:
+        condition: service_healthy
+volumes:
+  postgres_data:

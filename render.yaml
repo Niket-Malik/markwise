@@ -1,0 +1,120 @@
+services:
+  - type: web
+    name: markwise-hackathon-api
+    runtime: docker
+    region: singapore
+    plan: 1c-2g
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    preDeployCommand: alembic -c alembic.ini upgrade head
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://markwise-hackathon-web.onrender.com
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_SERVER_SIDE_ENCRYPTION
+        value: ""
+      - key: S3_SSE_KMS_KEY_ID
+        value: ""
+      - key: AI_PROVIDER
+        value: openai_compatible
+      - key: AI_API_BASE_URL
+        value: https://api.openai.com/v1
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        sync: false
+      - key: VISION_MODEL
+        sync: false
+      - key: EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: AI_TIMEOUT_SECONDS
+        value: "45"
+      - key: OCR_LANGUAGE
+        value: eng
+      - key: ACCESS_TOKEN_MINUTES
+        value: "30"
+
+  - type: web
+    name: markwise-hackathon-web
+    runtime: docker
+    region: singapore
+    plan: 0.5c-512mb
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        value: ""
+      - key: NEXT_PUBLIC_API_HOST
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+
+  - type: cron
+    name: markwise-hackathon-retention
+    runtime: docker
+    region: singapore
+    plan: 0.5c-512mb
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m app.retention
+    schedule: "15 4 * * *"
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: DATABASE_URL
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: DATABASE_URL
+      - key: STORAGE_BACKEND
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: STORAGE_BACKEND
+      - key: S3_ENDPOINT_URL
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: S3_ENDPOINT_URL
+      - key: S3_BUCKET
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: S3_BUCKET
+      - key: S3_REGION
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: S3_REGION
+      - key: S3_ACCESS_KEY_ID
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: S3_ACCESS_KEY_ID
+      - key: S3_SECRET_ACCESS_KEY
+        fromService:
+          type: web
+          name: markwise-hackathon-api
+          envVarKey: S3_SECRET_ACCESS_KEY
+      - key: S3_SERVER_SIDE_ENCRYPTION
+        value: ""

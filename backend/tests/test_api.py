@@ -1,0 +1,477 @@
+import os
+import json
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock
+
+os.environ.setdefault("DATABASE_URL", "sqlite://")
+
+import pytest
+from fastapi.testclient import TestClient
+from docx import Document
+from pypdf import PdfWriter
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from backend.app.main import Base, RateLimitMiddleware, app, configured_cors_origins, db_session, normalize_database_url
+
+
+@pytest.fixture()
+def client():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    def override_session():
+        with factory() as session:
+            yield session
+
+    app.dependency_overrides[db_session] = override_session
+    with TestClient(app) as test_client:
+        test_client.session_factory = factory
+        middleware = app.middleware_stack
+        while middleware is not None:
+            if isinstance(middleware, RateLimitMiddleware):
+                middleware._events.clear()
+            middleware = getattr(middleware, "app", None)
+        yield test_client
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
+
+def register(client, org, email):
+    response = client.post("/api/auth/register", json={"organization": org, "name": "Test Admin", "email": email, "password": "correct-horse-battery"})
+    assert response.status_code == 200
+    return response.json()["access_token"]
+
+
+def test_admin_confirmation_and_abstaining_claim(client):
+    token = register(client, "Acme", "admin@acme.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.put("/api/settings/retention", headers=headers, json={"upload_retention_days": 30}).json()["upload_retention_days"] == 30
+    created = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Avoid guarantee", "body": "guaranteed", "source": "Voice guide", "passage": "Do not promise guaranteed outcomes."})
+    assert created.status_code == 200
+    assert created.json()["status"] == "pending"
+
+    draft = client.post("/api/reviews", headers=headers, json={"title": "Launch copy", "content": "We cut onboarding by 60%, guaranteed."})
+    assert draft.status_code == 200
+    assert len(draft.json()["findings"]) == 1
+    assert draft.json()["findings"][0]["kind"] == "cannot_verify"
+    finding_id = draft.json()["findings"][0]["id"]
+    assert client.post(f"/api/findings/{finding_id}/decision", headers=headers, json={"decision": "edited", "suggestion": "Confirmed wording after review."}).status_code == 422
+    edit = client.post(f"/api/findings/{finding_id}/decision", headers=headers, json={"decision": "edited", "suggestion": "Confirmed wording after review.", "reason": "Reviewed the current customer study."})
+    assert edit.json()["suggestion"] == "Confirmed wording after review."
+    decision_history = client.get(f"/api/findings/{finding_id}/decisions", headers=headers).json()
+    assert decision_history[0]["reason"] == "Reviewed the current customer study."
+    assert client.post(f"/api/findings/{finding_id}/decision", headers=headers, json={"decision": "accepted"}).status_code == 422
+    changed_draft = client.patch(f"/api/reviews/{draft.json()['id']}", headers=headers, json={"content": "We cut onboarding by 50%."})
+    assert changed_draft.status_code == 200
+    assert len(changed_draft.json()["findings"]) == 1
+    assert client.get(f"/api/findings/{finding_id}/decisions", headers=headers).json()[0]["reason"] == "Reviewed the current customer study."
+    assert client.post(f"/api/findings/{finding_id}/decision", headers=headers, json={"decision": "accepted"}).status_code == 409
+
+    approved = client.post(f"/api/knowledge/{created.json()['id']}/approve", headers=headers)
+    assert approved.json()["status"] == "active"
+    reviewed = client.post("/api/reviews", headers=headers, json={"title": "Launch copy 2", "content": "We cut onboarding by 60%, guaranteed."})
+    kinds = {finding["kind"] for finding in reviewed.json()["findings"]}
+    assert {"restricted_term", "cannot_verify"}.issubset(kinds)
+    assert all(finding["citation"] for finding in reviewed.json()["findings"])
+
+    fact = client.post("/api/knowledge", headers=headers, json={"kind": "fact", "title": "Onboarding time reduction", "body": "Approved study: onboarding time reduced by up to 40%.", "source": "2025 customer study", "passage": "Reduces onboarding time by up to 40%."})
+    assert fact.json()["status"] == "pending"
+    client.post(f"/api/knowledge/{fact.json()['id']}/approve", headers=headers)
+    accurate = client.post("/api/reviews", headers=headers, json={"title": "Accurate claim", "content": "We cut onboarding by up to 40%."})
+    assert not any(f["kind"] in {"claim", "cannot_verify"} for f in accurate.json()["findings"])
+    compared = client.post("/api/reviews", headers=headers, json={"title": "Fact check", "content": "We cut onboarding by 60%."})
+    claim = next(f for f in compared.json()["findings"] if f["kind"] == "claim")
+    assert "2025 customer study" in claim["citation"]
+    applied = client.post(f"/api/findings/{claim['id']}/decision", headers=headers, json={"decision": "accepted"})
+    assert applied.status_code == 200 and applied.json()["content_updated"] is True
+    updated_review = next(item for item in client.get("/api/reviews", headers=headers).json() if item["id"] == compared.json()["id"])
+    assert updated_review["content"] == "Approved study: onboarding time reduced by up to 40%."
+    assert len(client.get(f"/api/reviews/{compared.json()['id']}/versions", headers=headers).json()) == 2
+    repeated = client.post("/api/reviews", headers=headers, json={"title": "Repeated wording", "content": "We cut onboarding by 60%. We cut onboarding by 60%."}).json()
+    repeated_claim = next(item for item in repeated["findings"] if item["kind"] == "claim")
+    assert client.post(f"/api/findings/{repeated_claim['id']}/decision", headers=headers, json={"decision": "accepted"}).status_code == 409
+    dashboard = client.get("/api/dashboard", headers=headers).json()
+    assert dashboard["guideline_gaps"][0]["type"] == "unsupported_claims"
+    assert dashboard["guideline_gaps"][0]["count"] >= 1
+
+
+def test_organisation_isolation(client):
+    owner = register(client, "Acme", "owner@acme.test")
+    outsider = register(client, "Other Co", "owner@other.test")
+    own_headers = {"Authorization": f"Bearer {owner}"}
+    other_headers = {"Authorization": f"Bearer {outsider}"}
+    review = client.post("/api/reviews", headers=own_headers, json={"title": "Private draft", "content": "An unverified 40% improvement."})
+    assert review.status_code == 200
+    assert client.get("/api/reviews", headers=other_headers).json() == []
+    hidden = client.post(f"/api/reviews/{review.json()['id']}/submit", headers=other_headers)
+    assert hidden.status_code == 404
+
+
+def test_cors_allows_only_configured_frontend_origins():
+    origins = configured_cors_origins("https://localhost:3000/, https://preview.example", "markwise-hackathon-web.onrender.com")
+    assert origins == ["https://localhost:3000", "https://preview.example", "https://markwise-hackathon-web.onrender.com"]
+
+
+def test_neon_database_urls_use_psycopg3_for_runtime_and_migrations():
+    assert normalize_database_url("postgresql://user:pass@host/db") == "postgresql+psycopg://user:pass@host/db?sslmode=require"
+    assert normalize_database_url("postgres://user:pass@host/db?sslmode=disable") == "postgresql+psycopg://user:pass@host/db?sslmode=require"
+    assert normalize_database_url("postgresql://user:pass@localhost/db") == "postgresql+psycopg://user:pass@localhost/db"
+    assert normalize_database_url("postgresql://user:pass@host/db?sslmode=verify-full") == "postgresql+psycopg://user:pass@host/db?sslmode=verify-full"
+
+
+def test_finding_decisions_and_submission_require_review_authority(client):
+    owner_token = register(client, "Workflow Co", "owner@workflow.test")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    creator = client.post("/api/team", headers=owner_headers, json={
+        "name": "Other Creator", "email": "creator@workflow.test", "role": "creator", "password": "creator-secure-password"
+    }).json()
+    reviewer = client.post("/api/team", headers=owner_headers, json={
+        "name": "Assigned Reviewer", "email": "reviewer@workflow.test", "role": "reviewer", "password": "reviewer-secure-password"
+    }).json()
+    creator_token = client.post("/api/auth/login", json={"email": creator["email"], "password": "creator-secure-password"}).json()["access_token"]
+    reviewer_token = client.post("/api/auth/login", json={"email": reviewer["email"], "password": "reviewer-secure-password"}).json()["access_token"]
+    creator_headers = {"Authorization": f"Bearer {creator_token}"}
+    reviewer_headers = {"Authorization": f"Bearer {reviewer_token}"}
+    review = client.post("/api/reviews", headers=owner_headers, json={"title": "Restricted draft", "content": "We guarantee 90% results."}).json()
+    finding_id = review["findings"][0]["id"]
+
+    assert client.post(f"/api/findings/{finding_id}/decision", headers=creator_headers, json={"decision": "accepted"}).status_code == 403
+    assert client.post(f"/api/reviews/{review['id']}/submit", headers=creator_headers).status_code == 403
+    assert client.post(f"/api/findings/{finding_id}/decision", headers=reviewer_headers, json={"decision": "accepted"}).status_code == 403
+
+    assert client.post(f"/api/reviews/{review['id']}/assign", headers=owner_headers, json={"user_id": reviewer["id"]}).status_code == 200
+    assert client.post(f"/api/reviews/{review['id']}/submit", headers=owner_headers).status_code == 200
+    accepted = client.post(f"/api/findings/{finding_id}/decision", headers=reviewer_headers, json={"decision": "dismissed", "reason": "I reviewed this flagged claim."})
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "dismissed"
+def test_comments_assignment_and_high_risk_review(client):
+    admin = register(client, "Acme", "admin@workflow.test")
+    admin_headers = {"Authorization": f"Bearer {admin}"}
+    created_review = client.post("/api/reviews", headers=admin_headers, json={"title": "Claim review", "content": "We cut costs by 60%."})
+    review_id = created_review.json()["id"]
+    reviewer = client.post("/api/team", headers=admin_headers, json={"email": "reviewer@workflow.test", "name": "Authorised Reviewer", "role": "reviewer", "password": "another-correct-password"})
+    assert reviewer.status_code == 200
+    assert client.post(f"/api/reviews/{review_id}/assign", headers=admin_headers, json={"user_id": reviewer.json()["id"]}).status_code == 200
+    assert client.get("/api/reviews", headers=admin_headers).json()[0]["assigned_to"] == reviewer.json()["id"]
+    comment = client.post(f"/api/reviews/{review_id}/comments", headers=admin_headers, json={"body": "Please confirm this number."})
+    assert comment.status_code == 200
+    assert client.get(f"/api/reviews/{review_id}/comments", headers=admin_headers).json()[0]["body"] == "Please confirm this number."
+    assert len(client.get(f"/api/reviews/{review_id}/versions", headers=admin_headers).json()) == 1
+    changed = client.patch(f"/api/reviews/{review_id}", headers=admin_headers, json={"content": "We reduced costs by 60 percent."})
+    assert changed.status_code == 200
+    versions = client.get(f"/api/reviews/{review_id}/versions", headers=admin_headers).json()
+    assert len(versions) == 2
+    assert versions[-1]["content"] == "We reduced costs by 60 percent."
+    assert client.get("/api/audit-events", headers=admin_headers).status_code == 200
+    assert client.get("/api/audit-events", headers={"Authorization": f"Bearer {register(client, 'Other', 'audit-outsider@test.test')}"}).json() == []
+
+    login = client.post("/api/auth/login", json={"email": "reviewer@workflow.test", "password": "another-correct-password"})
+    reviewer_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    unassigned_review = client.post("/api/reviews", headers=admin_headers, json={"title": "Unassigned review", "content": "Neutral campaign copy."}).json()
+    client.post(f"/api/reviews/{unassigned_review['id']}/submit", headers=admin_headers)
+    assert client.post(f"/api/reviews/{unassigned_review['id']}/decision", headers=reviewer_headers, json={"decision": "approved"}).status_code == 403
+    assert client.post(f"/api/reviews/{review_id}/submit", headers=admin_headers).status_code == 200
+    decision = client.post(f"/api/reviews/{review_id}/decision", headers=reviewer_headers, json={"decision": "approved"})
+    assert decision.status_code == 200
+    assert decision.json()["status"] == "approved"
+    assert client.delete(f"/api/reviews/{review_id}", headers=admin_headers).json()["deleted"] is True
+    assert client.get(f"/api/reviews/{review_id}/versions", headers=admin_headers).status_code == 404
+
+
+def test_external_analysis_requires_workspace_opt_in_and_validates_citations(client, monkeypatch):
+    import backend.app.main as main
+
+    token = register(client, "Acme", "ai-admin@acme.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    fact = client.post("/api/knowledge", headers=headers, json={"kind": "fact", "title": "Onboarding time", "body": "Approved: up to 40% less onboarding time.", "source": "Customer study", "passage": "Onboarding time fell by up to 40%."}).json()
+    client.post(f"/api/knowledge/{fact['id']}/approve", headers=headers)
+    rule = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Avoid guarantees", "body": "guaranteed", "source": "Voice guide", "passage": "Do not promise guaranteed outcomes."}).json()
+    client.post(f"/api/knowledge/{rule['id']}/approve", headers=headers)
+
+    for name, value in (("ai_provider", "openai_compatible"), ("ai_api_key", "test-key-only"), ("ai_model", "test-model"), ("embedding_model", "")):
+        monkeypatch.setattr(main.settings, name, value)
+    first = {"kind": "claim", "excerpt": "We cut onboarding by 60%, guaranteed", "explanation": "The cited study supports at most 40%.", "severity": "high", "confidence": 0.94, "cited_source_ids": [fact["id"]], "cannot_verify": False, "suggested_rewrite": "Customers reduced onboarding time by up to 40%.", "intent_preserved": True}
+    legal = {"kind": "legal", "excerpt": "guaranteed", "explanation": "The approved rule prohibits guarantees.", "severity": "high", "confidence": 0.9, "cited_source_ids": [rule["id"]], "cannot_verify": False, "suggested_rewrite": None, "intent_preserved": False}
+    second = {**first, "cited_source_ids": [99999], "suggested_rewrite": "Invented 99% result."}
+    responses = iter([[first, legal], [second]])
+
+    def fake_post(url, headers, json: dict, timeout):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": __import__("json").dumps({"findings": next(responses)})}}]}
+        return response
+
+    monkeypatch.setattr("backend.app.ai.httpx.post", fake_post)
+    review_without_consent = client.post("/api/reviews", headers=headers, json={"title": "No consent", "content": "We cut onboarding by 60%."}).json()
+    assert review_without_consent["ai_status"] == "disabled"
+
+    consent = client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    assert consent.json()["external_ai_enabled"] is True
+    verified = client.post("/api/reviews", headers=headers, json={"title": "Grounded", "content": "We cut onboarding by 60%, guaranteed."}).json()
+    assert verified["ai_status"] == "complete"
+    claim = next(f for f in verified["findings"] if f["kind"] == "claim")
+    assert "Customer study" in claim["citation"]
+    assert claim["suggestion"] == "Customers reduced onboarding time by up to 40%."
+    rule_finding = next(f for f in verified["findings"] if f["kind"] == "ai_legal")
+    dismissed = client.post(f"/api/findings/{rule_finding['id']}/decision", headers=headers, json={"decision": "dismissed", "reason": "This phrase is required in the approved legal line."})
+    assert dismissed.status_code == 200
+    insights = client.get("/api/dashboard", headers=headers).json()
+    assert insights["dismissed_findings"] == 1
+    assert insights["contested_rules"][0]["title"] == "Avoid guarantees"
+
+    invalid = client.post("/api/reviews", headers=headers, json={"title": "Invalid citation", "content": "We cut onboarding by 60%, guaranteed."}).json()
+    assert any(f["kind"] == "cannot_verify" and "99999" not in f["citation"] for f in invalid["findings"])
+
+
+def test_ai_abstains_on_unsourced_nonpercentage_claim(client, monkeypatch):
+    import backend.app.main as main
+
+    token = register(client, "No Facts Co", "claims@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "ai_provider", "unsupported")
+    monkeypatch.setattr(main.settings, "ai_api_key", "test-key-only")
+    monkeypatch.setattr(main.settings, "ai_model", "test-model")
+    assert client.get("/api/settings/privacy", headers=headers).json()["ai_configured"] is False
+    for name, value in (("ai_provider", "openai_compatible"), ("ai_api_key", "test-key-only"), ("ai_model", "test-model"), ("embedding_model", "")):
+        monkeypatch.setattr(main.settings, name, value)
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    candidate = {"kind": "claim", "excerpt": "Our service doubles your sales", "explanation": "The draft makes a factual performance claim.", "severity": "high", "confidence": 0.88, "cited_source_ids": [], "cannot_verify": True, "suggested_rewrite": None, "intent_preserved": False}
+
+    def fake_post(url, headers, json: dict, timeout):
+        assert json["model"] == "test-model"
+        payload = json_module.loads(json["messages"][1]["content"])
+        assert payload["approved_sources"] == []
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": json_module.dumps({"findings": [candidate]})}}]}
+        return response
+
+    import json as json_module
+    monkeypatch.setattr("backend.app.ai.httpx.post", fake_post)
+    review = client.post("/api/reviews", headers=headers, json={"title": "Unsourced claim", "content": "Our service doubles your sales."}).json()
+    assert review["ai_status"] == "no_sources"
+    finding = next(item for item in review["findings"] if item["kind"] == "cannot_verify")
+    assert finding["excerpt"] == "Our service doubles your sales"
+    assert finding["citation"] == "No matching active approved fact was validated in the retrieved workspace sources."
+
+
+def test_docx_guidelines_are_imported_as_pending_passages(client):
+    token = register(client, "Acme", "docx-admin@acme.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    document = Document()
+    document.add_heading("Legal language", level=1)
+    document.add_paragraph("Do not promise guaranteed outcomes to customers.")
+    buffer = __import__("io").BytesIO()
+    document.save(buffer)
+    response = client.post("/api/knowledge/import", headers=headers, files={"file": ("brand-guide.docx", buffer.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
+    assert response.status_code == 200
+    imported = response.json()
+    assert imported["candidate_count"] == 1
+    assert imported["status"] == "pending_admin_confirmation"
+    assert imported["items"][0]["status"] == "pending"
+    assert "section Legal language" in imported["items"][0]["source"]
+    assert "guaranteed outcomes" in imported["items"][0]["passage"]
+    assert client.delete(f"/api/uploads/{imported['asset_id']}", headers=headers).json()["deleted"] is True
+
+
+def test_image_ocr_and_scanned_pdf_ocr(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    from PIL import Image, ImageDraw
+    import io
+
+    token = register(client, "Acme", "ocr-admin@acme.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "Approved OCR sample")
+
+    image = Image.new("RGB", (600, 160), "white")
+    ImageDraw.Draw(image).text((20, 40), "Approved OCR sample", fill="black")
+    image_bytes = io.BytesIO(); image.save(image_bytes, format="PNG")
+    image_result = client.post("/api/uploads", headers=headers, files={"file": ("sample.png", image_bytes.getvalue(), "image/png")})
+    assert image_result.status_code == 200
+    assert image_result.json()["extracted_text"] == "Approved OCR sample"
+    assert image_result.json()["note"] is None
+    assert client.get("/api/uploads", headers=headers).json()[0]["filename"] == "sample.png"
+    member = client.post("/api/team", headers=headers, json={"name": "Content Creator", "email": "creator@ocr.test", "role": "creator", "password": "creator-secure-password"}).json()
+    member_token = client.post("/api/auth/login", json={"email": member["email"], "password": "creator-secure-password"}).json()["access_token"]
+    assert client.get("/api/uploads", headers={"Authorization": f"Bearer {member_token}"}).json() == []
+    assert client.delete(f"/api/uploads/{image_result.json()['id']}", headers=headers).json()["deleted"] is True
+
+    writer = PdfWriter(); writer.add_blank_page(width=612, height=792)
+    pdf_bytes = io.BytesIO(); writer.write(pdf_bytes)
+    pdf_result = client.post("/api/uploads", headers=headers, files={"file": ("scanned.pdf", pdf_bytes.getvalue(), "application/pdf")})
+    assert pdf_result.status_code == 200
+    assert "Approved OCR sample" in pdf_result.json()["extracted_text"]
+    assert pdf_result.json()["ocr_pages"] == [1]
+
+
+def test_scheduled_retention_removes_uploads_and_review_data(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    import backend.app.retention as retention
+    import io
+    from PIL import Image, ImageDraw
+
+    token = register(client, "Retention Co", "retention-admin@acme.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "Brand image")
+    assert client.put("/api/settings/retention", headers=headers, json={"upload_retention_days": 1, "review_retention_days": 1}).status_code == 200
+    review = client.post("/api/reviews", headers=headers, json={"title": "Temporary draft", "content": "Temporary copy for deletion."}).json()
+    image = Image.new("RGB", (200, 100), "white")
+    buffer = io.BytesIO(); image.save(buffer, format="PNG")
+    asset = client.post("/api/uploads", headers=headers, files={"file": ("temporary.png", buffer.getvalue(), "image/png")}).json()
+    old = datetime.now(timezone.utc) - timedelta(days=2)
+    with client.session_factory() as db:
+        db.get(main.Review, review["id"]).created_at = old
+        db.get(main.StoredAsset, asset["id"]).created_at = old
+        db.commit()
+    monkeypatch.setattr(retention, "SessionLocal", client.session_factory)
+    assert retention.purge_expired_uploads() == 2
+    assert client.get("/api/reviews", headers=headers).json() == []
+
+
+def test_upload_rejects_mismatched_file_signature_before_storage(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    token = register(client, "Upload Co", "upload-admin@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path))
+    response = client.post("/api/uploads", headers=headers, files={"file": ("not-really.png", b"plain text pretending to be an image", "image/png")})
+    assert response.status_code == 422
+    assert list(tmp_path.rglob("*")) == []
+    assert not list(tmp_path.rglob("*.png"))
+
+
+def test_s3_storage_adapter_uses_opaque_org_scoped_keys(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from backend.app.main import Settings
+    from backend.app.storage import delete_object, put_object
+
+    calls = []
+    fake_client = SimpleNamespace(
+        put_object=lambda **kwargs: calls.append(("put", kwargs)),
+        delete_object=lambda **kwargs: calls.append(("delete", kwargs)),
+    )
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: fake_client))
+    config = Settings(storage_backend="s3", s3_bucket="markwise-test", s3_region="us-east-1", s3_access_key_id="test-key", s3_secret_access_key="test-secret")
+    key = put_object(42, "random-object", "../brand logo.png", b"image-bytes", config)
+    assert key == "s3:42/random-object-brand_logo.png"
+    delete_object(key, config)
+    assert calls[0][1]["Bucket"] == "markwise-test"
+    assert calls[0][1]["Key"].startswith("42/")
+    assert calls[0][1]["ServerSideEncryption"] == "AES256"
+    assert calls[1][1]["Key"] == calls[0][1]["Key"]
+    kms = Settings(storage_backend="s3", s3_bucket="markwise-test", s3_region="us-east-1", s3_access_key_id="test-key", s3_secret_access_key="test-secret", s3_server_side_encryption="aws:kms", s3_sse_kms_key_id="test-kms")
+    put_object(42, "kms-object", "guide.pdf", b"pdf", kms)
+    assert calls[-1][1]["ServerSideEncryption"] == "aws:kms"
+    assert calls[-1][1]["SSEKMSKeyId"] == "test-kms"
+
+
+def test_r2_storage_uses_managed_encryption_without_unsupported_sse_headers(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from backend.app.main import Settings
+    from backend.app.storage import put_object
+
+    calls = []
+    fake_client = SimpleNamespace(put_object=lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: fake_client))
+    config = Settings(storage_backend="s3", s3_endpoint_url="https://acct.r2.cloudflarestorage.com", s3_bucket="markwise", s3_region="auto", s3_access_key_id="r2-key", s3_secret_access_key="r2-secret")
+    put_object(9, "object", "guide.pdf", b"pdf", config)
+    assert calls[0]["Bucket"] == "markwise"
+    assert "ServerSideEncryption" not in calls[0]
+
+
+def test_embedding_adapter_checks_batch_size_and_vector_dimensions(monkeypatch):
+    from backend.app.ai import AIProviderError, OpenAICompatibleProvider
+    from backend.app.main import Settings
+
+    vectors = [[0.125] * 1536, [0.25] * 1536]
+    def fake_post(url, headers, json: dict, timeout):
+        response = Mock(); response.raise_for_status.return_value = None
+        response.json.return_value = {"data": [{"index": 1, "embedding": vectors[1]}, {"index": 0, "embedding": vectors[0]}]}
+        return response
+    monkeypatch.setattr("backend.app.ai.httpx.post", fake_post)
+    provider = OpenAICompatibleProvider(Settings(ai_api_key="test", embedding_model="embed-test"))
+    result = provider.embed_many(["first", "second"])
+    assert result == vectors
+    vectors[1].append(0.5)
+    with pytest.raises(AIProviderError):
+        provider.embed_many(["first", "second"])
+
+
+def test_visual_review_uses_approved_sources_and_validated_vision_output(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    import io
+    from PIL import Image, ImageDraw
+
+    token = register(client, "Visual Co", "visual-admin@acme.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "Contrast sample")
+    monkeypatch.setattr("pytesseract.image_to_data", lambda *args, **kwargs: {"text": [], "conf": [], "left": [], "top": [], "width": [], "height": []})
+    image = Image.new("RGB", (320, 160), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 300, 140), fill="#ff0000")
+    buffer = io.BytesIO(); image.save(buffer, format="PNG")
+
+    source = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Infographic contrast", "body": "Maintain high contrast in infographic text.", "source": "Design guide", "passage": "Ensure text is readable on its background."}).json()
+    client.post(f"/api/knowledge/{source['id']}/approve", headers=headers)
+    no_alt = client.post("/api/visual-reviews", headers=headers, data={"role": "informative", "alt_text": ""}, files={"file": ("graphic.png", buffer.getvalue(), "image/png")}).json()
+    alt_finding = next(f for f in no_alt["findings"] if f["kind"] == "accessibility")
+    assert "SC 1.1.1" in alt_finding["citation"]
+
+    palette_rule = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Brand palette", "body": "Use the approved blue #0000ff for brand graphics.", "source": "Visual guide", "passage": "Approved palette: #0000ff."}).json()
+    client.post(f"/api/knowledge/{palette_rule['id']}/approve", headers=headers)
+    palette_check = client.post("/api/visual-reviews", headers=headers, data={"role": "brand_graphic", "alt_text": ""}, files={"file": ("graphic.png", buffer.getvalue(), "image/png")}).json()
+    colour_finding = next(f for f in palette_check["findings"] if f["kind"] == "colour")
+    assert f"RULE #{palette_rule['id']}" in colour_finding["citation"]
+
+    monkeypatch.setattr("pytesseract.image_to_data", lambda *args, **kwargs: {"text": ["Low contrast"], "conf": ["90"], "left": [20], "top": [40], "width": [120], "height": [30]})
+    low_contrast = Image.new("RGB", (320, 160), "white")
+    ImageDraw.Draw(low_contrast).text((20, 40), "Low contrast", fill="#999999")
+    low_buffer = io.BytesIO(); low_contrast.save(low_buffer, format="PNG")
+    contrast_check = client.post("/api/visual-reviews", headers=headers, data={"role": "informative", "alt_text": "Low contrast example"}, files={"file": ("low-contrast.png", low_buffer.getvalue(), "image/png")}).json()
+    contrast_finding = next(f for f in contrast_check["findings"] if f["kind"] == "contrast")
+    assert "below 4.5:1" in contrast_finding["explanation"]
+    assert "SC 1.4.3" in contrast_finding["citation"]
+
+    reference = Image.new("RGB", (320, 160), "white")
+    reference_draw = ImageDraw.Draw(reference)
+    for x in range(0, 320, 30):
+        reference_draw.line((x, 0, x + 100, 160), fill="black", width=10)
+    reference_buffer = io.BytesIO(); reference.save(reference_buffer, format="PNG")
+    logo_check = client.post("/api/visual-reviews", headers=headers, data={"role": "logo", "alt_text": ""}, files={"file": ("logo.png", buffer.getvalue(), "image/png"), "reference_logo": ("reference.png", reference_buffer.getvalue(), "image/png")}).json()
+    logo_finding = next(f for f in logo_check["findings"] if f["kind"] == "logo")
+    assert "User-supplied reference logo" in logo_finding["citation"]
+
+    for name, value in (("ai_provider", "openai_compatible"), ("ai_api_key", "test-key-only"), ("ai_model", "test-model"), ("vision_model", "vision-test")):
+        monkeypatch.setattr(main.settings, name, value)
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    candidate = {"kind": "contrast", "excerpt": "Image region x=10 y=10 width=80 height=40", "explanation": "The cited guide requires readable contrast.", "severity": "medium", "confidence": 0.8, "cited_source_ids": [source["id"]], "cannot_verify": False, "suggested_rewrite": None, "intent_preserved": False}
+
+    def fake_post(url, headers, json: dict, timeout):
+        assert json["model"] == "vision-test"
+        assert json["messages"][1]["content"][1]["type"] == "image_url"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": __import__("json").dumps({"findings": [candidate]})}}]}
+        return response
+
+    monkeypatch.setattr("backend.app.ai.httpx.post", fake_post)
+    result = client.post("/api/visual-reviews", headers=headers, data={"role": "informative", "alt_text": "A red rectangle"}, files={"file": ("graphic.png", buffer.getvalue(), "image/png")})
+    assert result.status_code == 200
+    assert result.json()["ai_status"] == "complete"
+    finding = next(f for f in result.json()["findings"] if f["kind"] == "ai_contrast")
+    assert "Infographic contrast" in finding["citation"]
+
+
+def test_z_auth_rate_limit(client):
+    responses = [client.post("/api/auth/login", json={"email": "nobody@example.test", "password": "wrong-password"}) for _ in range(21)]
+    assert all(response.status_code == 401 for response in responses[:20])
+    assert responses[-1].status_code == 429
+    assert int(responses[-1].headers["Retry-After"]) > 0
