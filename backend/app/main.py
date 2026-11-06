@@ -25,7 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete as sql_delete, func, select, update
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete as sql_delete, false, func, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
 
@@ -50,12 +50,18 @@ class Settings(BaseSettings):
     s3_secret_access_key: str = ""
     s3_server_side_encryption: str = "AES256"
     s3_sse_kms_key_id: str = ""
-    ai_provider: str = ""
+    ai_provider: str = "openrouter"
+    openrouter_api_key: str = ""
+    openrouter_api_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_text_model: str = "nvidia/nemotron-3.5-super-vl:free"
+    openrouter_vision_model: str = "nvidia/nemotron-3.5-super-vl:free"
+    openrouter_max_requests_per_minute: int = 15
     ai_api_base_url: str = "https://api.openai.com/v1"
     ai_api_key: str = ""
     ai_model: str = ""
     vision_model: str = ""
-    embedding_model: str = ""
+    embedding_model: str = "nvidia/nemotron-3.5-embed-1b:free"
+    embedding_dimensions: int = 1536
     gemini_api_key: str = ""
     gemini_text_model: str = "gemini-3.8-flash"
     gemini_vision_model: str = "gemini-3.8-flash"
@@ -68,7 +74,7 @@ class Settings(BaseSettings):
     ai_fallback_vision_model: str = "gpt-6-luna"
     ai_fallback_text_model_alternate: str = "gpt-5.6-luna"
     ai_fallback_vision_model_alternate: str = "gpt-5.6-luna"
-    embedding_provider: str = "openai_compatible"
+    embedding_provider: str = "openrouter"
     ai_timeout_seconds: float = 30
     ai_provider_max_retries: int = 2
     ai_retry_base_seconds: float = 0.5
@@ -121,6 +127,9 @@ class Organization(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(160))
     external_ai_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    external_ai_consent_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    openrouter_free_ai_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    openrouter_consent_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     upload_retention_days: Mapped[int] = mapped_column(Integer, default=0)
     review_retention_days: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -169,6 +178,7 @@ class KnowledgeChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    embedding_space: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class Review(Base):
@@ -290,6 +300,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         host = request.client.host if request.client else "unknown"
         if path in {"/api/auth/login", "/api/auth/register"}:
             group, maximum, window = path.rsplit("/", 1)[-1], 20, 600
+        elif request.method == "POST" and (path == "/api/reviews" or path == "/api/visual-reviews" or (path.startswith("/api/reviews/") and path.endswith("/retry-ai"))):
+            group, maximum, window = "ai-analysis", 10, 60
         elif path in {"/api/uploads", "/api/visual-reviews", "/api/knowledge/import"}:
             group, maximum, window = "upload", 20, 60
         else:
@@ -332,6 +344,37 @@ bearer = HTTPBearer(auto_error=False)
 def db_session():
     with SessionLocal() as session:
         yield session
+
+
+def workspace_external_ai_guard(organization_id: int, external_consent_version: int):
+    """Return a fresh-connection consent check for each outbound provider request."""
+    def check() -> None:
+        from .ai import ConsentWithdrawnError
+        with SessionLocal() as consent_db:
+            row = consent_db.execute(select(Organization.external_ai_enabled,
+                                            Organization.external_ai_consent_version)
+                                     .where(Organization.id == organization_id)).one_or_none()
+        if row is None or not row.external_ai_enabled or row.external_ai_consent_version != external_consent_version:
+            raise ConsentWithdrawnError("Workspace external AI consent changed during processing")
+    return check
+
+
+def workspace_openrouter_ai_guard(organization_id: int, external_consent_version: int,
+                                  openrouter_consent_version: int):
+    """Require both workspace opt-ins and the same consent generation at send time."""
+    def check() -> None:
+        from .ai import ConsentWithdrawnError
+        with SessionLocal() as consent_db:
+            row = consent_db.execute(select(Organization.external_ai_enabled,
+                                            Organization.openrouter_free_ai_enabled,
+                                            Organization.external_ai_consent_version,
+                                            Organization.openrouter_consent_version)
+                                     .where(Organization.id == organization_id)).one_or_none()
+        if (row is None or not row.external_ai_enabled or not row.openrouter_free_ai_enabled
+                or row.external_ai_consent_version != external_consent_version
+                or row.openrouter_consent_version != openrouter_consent_version):
+            raise ConsentWithdrawnError("Workspace OpenRouter consent changed during processing")
+    return check
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -439,7 +482,8 @@ class AssignmentIn(BaseModel):
 
 
 class PrivacySettingsIn(BaseModel):
-    external_ai_enabled: bool
+    external_ai_enabled: bool | None = None
+    openrouter_free_ai_enabled: bool | None = None
 
 
 class RetentionSettingsIn(BaseModel):
@@ -501,7 +545,7 @@ def remove_review_records(db: Session, review: Review):
 @app.get("/health")
 def health(db: Session = Depends(db_session)):
     db.execute(select(1))
-    return {"status": "ok", "database": "connected", "ai_configured": bool(settings.ai_provider == "gemini" and settings.gemini_api_key)}
+    return {"status": "ok", "database": "connected", "ai_configured": bool(settings.openrouter_api_key or settings.gemini_api_key)}
 
 
 @app.post("/api/auth/register")
@@ -549,22 +593,28 @@ def create_team_member(data: TeamMemberIn, user: User = Depends(roles("admin")),
 
 @app.get("/api/settings/privacy")
 def get_privacy_settings(user: User = Depends(current_user), db: Session = Depends(db_session)):
-    from .ai import provider_status
+    from .ai import embedding_space_for_config, provider_status
     organization = db.get(Organization, user.organization_id)
-    provider_configured = settings.ai_provider.strip().lower() in {"gemini", "google_gemini"} and bool(settings.gemini_api_key)
-    fallback_configured = settings.ai_fallback_provider.strip().lower() in {"openai", "openai_compatible"} and bool(settings.ai_fallback_api_key or settings.ai_api_key)
+    openrouter_configured = bool(settings.openrouter_api_key)
+    gemini_configured = bool(settings.gemini_api_key)
+    provider_configured = gemini_configured or (organization.openrouter_free_ai_enabled and openrouter_configured)
+    semantic_ready = bool(organization.openrouter_free_ai_enabled and openrouter_configured and settings.embedding_provider == "openrouter")
     semantic_chunks = db.scalar(select(func.count(KnowledgeChunk.id)).where(
-        KnowledgeChunk.organization_id == user.organization_id, KnowledgeChunk.embedding.is_not(None)
+        KnowledgeChunk.organization_id == user.organization_id, KnowledgeChunk.embedding.is_not(None),
+        KnowledgeChunk.embedding_space == embedding_space_for_config(),
     )) or 0
     return {
         "external_ai_enabled": organization.external_ai_enabled,
-        "provider": settings.ai_provider or None,
-        "model": settings.gemini_text_model if provider_configured else None,
-        "vision_model": settings.gemini_vision_model if provider_configured else None,
-        "ai_configured": bool(provider_configured and settings.gemini_text_model and fallback_configured),
-        "vision_configured": bool(provider_configured and settings.gemini_vision_model and fallback_configured),
-        "embeddings_configured": bool(fallback_configured and settings.embedding_model == "text-embedding-3-small"),
-        "fallback_provider": settings.ai_fallback_provider if fallback_configured else None,
+        "openrouter_free_ai_enabled": organization.openrouter_free_ai_enabled,
+        "openrouter_configured": openrouter_configured,
+        "gemini_configured": gemini_configured,
+        "provider": "openrouter" if organization.openrouter_free_ai_enabled and openrouter_configured else "gemini" if gemini_configured else None,
+        "model": settings.openrouter_text_model if organization.openrouter_free_ai_enabled and openrouter_configured else settings.gemini_text_model if gemini_configured else None,
+        "vision_model": settings.openrouter_vision_model if organization.openrouter_free_ai_enabled and openrouter_configured else settings.gemini_vision_model if gemini_configured else None,
+        "ai_configured": provider_configured,
+        "vision_configured": provider_configured,
+        "embeddings_configured": semantic_ready,
+        "fallback_provider": "gemini" if organization.openrouter_free_ai_enabled and openrouter_configured and gemini_configured else None,
         "provider_status": provider_status(),
         "semantic_chunks": semantic_chunks,
     }
@@ -573,18 +623,46 @@ def get_privacy_settings(user: User = Depends(current_user), db: Session = Depen
 @app.put("/api/settings/privacy")
 def update_privacy_settings(data: PrivacySettingsIn, background_tasks: BackgroundTasks, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
     organization = db.get(Organization, user.organization_id)
-    organization.external_ai_enabled = data.external_ai_enabled
-    audit(db, user, "privacy.external_ai_toggled", "organization", organization.id)
+    if data.external_ai_enabled is None and data.openrouter_free_ai_enabled is None:
+        raise HTTPException(422, "At least one AI privacy setting must be supplied")
+    if data.external_ai_enabled is False and data.openrouter_free_ai_enabled is True:
+        raise HTTPException(422, "Enable external AI before opting into OpenRouter")
+    previous_external = organization.external_ai_enabled
+    previous_openrouter = organization.openrouter_free_ai_enabled
+    if data.external_ai_enabled is not None:
+        organization.external_ai_enabled = data.external_ai_enabled
+        if not data.external_ai_enabled:
+            organization.openrouter_free_ai_enabled = False
+    if data.openrouter_free_ai_enabled is not None:
+        if data.openrouter_free_ai_enabled and not organization.external_ai_enabled:
+            raise HTTPException(409, "Enable the external AI setting before enabling OpenRouter")
+        organization.openrouter_free_ai_enabled = data.openrouter_free_ai_enabled
+    if previous_external != organization.external_ai_enabled:
+        audit(db, user, "privacy.external_ai_toggled", "organization", organization.id)
+    if previous_openrouter != organization.openrouter_free_ai_enabled:
+        audit(db, user, "privacy.openrouter_free_ai_toggled", "organization", organization.id)
+    if previous_external != organization.external_ai_enabled:
+        db.execute(update(Organization).where(Organization.id == organization.id).values(
+            external_ai_consent_version=Organization.external_ai_consent_version + 1,
+        ), execution_options={"synchronize_session": False})
+    if previous_external != organization.external_ai_enabled or previous_openrouter != organization.openrouter_free_ai_enabled:
+        db.execute(update(Organization).where(Organization.id == organization.id).values(
+            openrouter_consent_version=Organization.openrouter_consent_version + 1,
+        ), execution_options={"synchronize_session": False})
     db.commit()
-    if not data.external_ai_enabled:
+    if not organization.external_ai_enabled or not organization.openrouter_free_ai_enabled:
+        from .ai import clear_embedding_query_cache
+        clear_embedding_query_cache(user.organization_id)
         chunks = db.scalars(select(KnowledgeChunk).where(KnowledgeChunk.organization_id == user.organization_id, KnowledgeChunk.embedding.is_not(None))).all()
         for chunk in chunks:
             chunk.embedding = None
+            chunk.embedding_space = None
         db.commit()
-    elif settings.embedding_model and (settings.ai_fallback_api_key or settings.ai_api_key):
+    should_backfill = bool(organization.external_ai_enabled and organization.openrouter_free_ai_enabled and settings.openrouter_api_key)
+    if should_backfill:
         background_tasks.add_task(backfill_knowledge_embeddings, user.organization_id)
     result = get_privacy_settings(user, db)
-    result["embedding_backfill_queued"] = bool(data.external_ai_enabled and settings.embedding_model and (settings.ai_fallback_api_key or settings.ai_api_key))
+    result["embedding_backfill_queued"] = should_backfill
     return result
 
 
@@ -593,47 +671,81 @@ def get_provider_status(user: User = Depends(roles("admin"))):
     """Workspace admin-only, credential-free provider and circuit status."""
     from .ai import provider_status
     return {
-        "primary": settings.ai_provider,
-        "fallback": settings.ai_fallback_provider,
-        "primary_model": settings.gemini_text_model,
-        "primary_vision_model": settings.gemini_vision_model,
-        "primary_alternate_model": settings.gemini_text_model_alternate,
-        "primary_alternate_vision_model": settings.gemini_vision_model_alternate,
-        "fallback_model": settings.ai_fallback_text_model,
-        "fallback_vision_model": settings.ai_fallback_vision_model,
-        "fallback_alternate_model": settings.ai_fallback_text_model_alternate,
-        "fallback_alternate_vision_model": settings.ai_fallback_vision_model_alternate,
+        "primary": "openrouter",
+        "fallback": "gemini",
+        "primary_model": settings.openrouter_text_model,
+        "primary_vision_model": settings.openrouter_vision_model,
+        "openrouter_configured": bool(settings.openrouter_api_key),
+        "fallback_configured": bool(settings.gemini_api_key),
+        "fallback_model": settings.gemini_text_model,
+        "fallback_vision_model": settings.gemini_vision_model,
+        "fallback_alternate_model": settings.gemini_text_model_alternate,
+        "fallback_alternate_vision_model": settings.gemini_vision_model_alternate,
+        "embedding_model": settings.embedding_model,
+        "embedding_dimensions": settings.embedding_dimensions,
         "status": provider_status(),
     }
 
 
 def backfill_knowledge_embeddings(organization_id: int):
-    """Fill vectors for sources approved before the workspace opted into embeddings."""
-    from .ai import AIProviderError, embedding_provider_from_config
+    """Fill missing/stale vectors in bounded, resumable batches; never schedule retries itself."""
+    from .ai import AIProviderError, ConsentWithdrawnError, embedding_provider_from_config
+    if not _embedding_backfill_lock.acquire(blocking=False):
+        return
     try:
-        provider = embedding_provider_from_config()
         with SessionLocal() as db:
             organization = db.get(Organization, organization_id)
-            if not organization or not organization.external_ai_enabled or not settings.embedding_model:
+            if not organization or not organization.external_ai_enabled or not organization.openrouter_free_ai_enabled or not settings.embedding_model:
                 return
-            chunks = db.scalars(select(KnowledgeChunk).where(
-                KnowledgeChunk.organization_id == organization_id,
-                KnowledgeChunk.embedding.is_(None),
-            ).order_by(KnowledgeChunk.id)).all()
-            for offset in range(0, len(chunks), 64):
-                if not organization.external_ai_enabled:
+            consent_guard = workspace_openrouter_ai_guard(
+                organization_id, organization.external_ai_consent_version,
+                organization.openrouter_consent_version,
+            )
+            consent_guard()
+            provider = embedding_provider_from_config(consent_guard=consent_guard)
+            from .ai import embedding_space_for_config
+            embedding_space = embedding_space_for_config()
+            while True:
+                consent_guard()
+                batch = db.scalars(select(KnowledgeChunk).where(
+                    KnowledgeChunk.organization_id == organization_id,
+                    (KnowledgeChunk.embedding.is_(None)) | (KnowledgeChunk.embedding_space.is_(None)) |
+                    (KnowledgeChunk.embedding_space != embedding_space),
+                ).order_by(KnowledgeChunk.id).limit(64).with_for_update(skip_locked=True)).all()
+                if not batch:
                     break
-                batch = chunks[offset:offset + 64]
                 try:
                     vectors = provider.embed_many([chunk.text for chunk in batch])
+                    # A request already sent cannot be recalled, but never persist its
+                    # result if consent changed while it was in flight.
+                    consent_guard()
                 except AIProviderError as exc:
                     logger.warning("Semantic embedding backfill paused (%s)", type(exc).__name__)
                     break
                 for chunk, vector in zip(batch, vectors):
                     chunk.embedding = vector
+                    chunk.embedding_space = embedding_space
                 db.commit()
     except Exception as exc:
         logger.warning("Semantic embedding backfill did not complete (%s)", type(exc).__name__)
+    finally:
+        _embedding_backfill_lock.release()
+
+
+_embedding_backfill_lock = threading.Lock()
+
+
+@app.post("/api/settings/embeddings/backfill")
+def resume_embedding_backfill(background_tasks: BackgroundTasks,
+                              user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    """Explicitly resume chunks left lexical-only by a prior bounded provider failure."""
+    organization = db.get(Organization, user.organization_id)
+    if not organization.external_ai_enabled or not organization.openrouter_free_ai_enabled:
+        raise HTTPException(409, "Enable both external AI and OpenRouter consent before indexing")
+    if not settings.openrouter_api_key:
+        raise HTTPException(503, "OpenRouter embedding provider is not configured")
+    background_tasks.add_task(backfill_knowledge_embeddings, organization.id)
+    return {"status": "queued"}
 
 
 @app.get("/api/settings/retention")
@@ -732,22 +844,32 @@ def approve_knowledge(item_id: int, user: User = Depends(roles("admin")), db: Se
     organization = db.get(Organization, user.organization_id)
     source_text = "\n".join([row.title, row.body, row.passage])
     provider = None
-    if organization.external_ai_enabled and settings.embedding_model:
+    consent_guard = None
+    if organization.external_ai_enabled and organization.openrouter_free_ai_enabled and settings.embedding_model:
         try:
             from .ai import embedding_provider_from_config
-            provider = embedding_provider_from_config()
+            consent_guard = workspace_openrouter_ai_guard(
+                user.organization_id, organization.external_ai_consent_version,
+                organization.openrouter_consent_version,
+            )
+            provider = embedding_provider_from_config(consent_guard=consent_guard)
         except Exception as exc:
             logger.info("Source embedding unavailable during confirmation (%s)", type(exc).__name__)
     chunks = chunk_source(source_text)
     embeddings = [None] * len(chunks)
+    embedding_space = None
     if provider and chunks:
         try:
             embeddings = provider.embed_many(chunks)
+            consent_guard()
+            from .ai import embedding_space_for_config
+            embedding_space = embedding_space_for_config()
         except Exception as exc:
             logger.warning("Knowledge source remains lexical-only (%s)", type(exc).__name__)
     for index, chunk in enumerate(chunks):
         embedding = embeddings[index]
-        db.add(KnowledgeChunk(organization_id=user.organization_id, knowledge_id=row.id, chunk_index=index, text=chunk, embedding=embedding))
+        db.add(KnowledgeChunk(organization_id=user.organization_id, knowledge_id=row.id, chunk_index=index, text=chunk,
+                              embedding=embedding, embedding_space=embedding_space if embedding is not None else None))
     row.status = "active"; audit(db, user, "knowledge.approved", "knowledge", row.id); db.commit()
     return serialize_knowledge(row)
 
@@ -915,17 +1037,25 @@ def analyse_review_content(db: Session, user: User, content: str, channel: str, 
     organization = db.get(Organization, user.organization_id)
     ai_status = "disabled"
     if organization.external_ai_enabled:
-        from .ai import AIProviderError, embedding_provider_from_config, provider_from_config
+        from .ai import AIProviderError, embedding_provider_from_config, embedding_space_for_config, provider_from_config
         from .retrieval import retrieve_approved
+        external_guard = workspace_external_ai_guard(user.organization_id, organization.external_ai_consent_version)
+        openrouter_guard = workspace_openrouter_ai_guard(
+            user.organization_id, organization.external_ai_consent_version,
+            organization.openrouter_consent_version,
+        )
         try:
-            provider = provider_from_config()
+            provider = provider_from_config(allow_openrouter=organization.openrouter_free_ai_enabled,
+                                            external_consent_guard=external_guard,
+                                            openrouter_consent_guard=openrouter_guard)
             query_embedding = None
-            if settings.embedding_model:
+            if organization.openrouter_free_ai_enabled and settings.embedding_model:
                 try:
-                    query_embedding = embedding_provider_from_config().embed(content)
+                    query_embedding = embedding_provider_from_config(consent_guard=openrouter_guard).embed_query(content, workspace_id=user.organization_id)
                 except AIProviderError as exc:
                     logger.info("Semantic query embedding unavailable; using lexical retrieval (%s)", type(exc).__name__)
-            retrieved = retrieve_approved(db, user.organization_id, content, query_embedding)
+            retrieved = retrieve_approved(db, user.organization_id, content, query_embedding,
+                                          embedding_space=embedding_space_for_config())
             analysis = provider.analyse(content, {"channel": channel, "audience": audience, "goal": goal}, retrieved)
             results.extend(validate_ai_findings(content, analysis.findings, retrieved, results))
             ai_status = "complete" if retrieved else "no_sources"
@@ -1028,14 +1158,30 @@ def reanalyse_visual_review(db: Session, user: User, review: Review) -> tuple[li
     organization = db.get(Organization, user.organization_id)
     if not organization.external_ai_enabled:
         return fallback_findings(), "disabled"
+    external_guard = workspace_external_ai_guard(user.organization_id, organization.external_ai_consent_version)
+    openrouter_guard = workspace_openrouter_ai_guard(
+        user.organization_id, organization.external_ai_consent_version,
+        organization.openrouter_consent_version,
+    )
     from .retrieval import retrieve_approved
     query = f"{review.audience} logo palette colour contrast accessibility alt text {review.content}"
-    retrieved = retrieve_approved(db, user.organization_id, query)
+    from .ai import embedding_space_for_config
+    query_embedding = None
+    if organization.external_ai_enabled and organization.openrouter_free_ai_enabled:
+        try:
+            from .ai import embedding_provider_from_config
+            query_embedding = embedding_provider_from_config(consent_guard=openrouter_guard).embed_query(query, workspace_id=user.organization_id)
+        except Exception as exc:
+            logger.info("Visual semantic retrieval unavailable; using lexical retrieval (%s)", type(exc).__name__)
+    retrieved = retrieve_approved(db, user.organization_id, query, query_embedding,
+                                  embedding_space=embedding_space_for_config())
     if not retrieved:
         return fallback_findings(), "no_sources"
     try:
         from .ai import AIProviderError, provider_from_config
-        provider = provider_from_config()
+        provider = provider_from_config(allow_openrouter=organization.external_ai_enabled and organization.openrouter_free_ai_enabled,
+                                        external_consent_guard=external_guard,
+                                        openrouter_consent_guard=openrouter_guard)
         candidates = provider.analyse_image(image_data, mime, {"role": review.audience, "alt_text": review.goal}, retrieved, reference_data, reference_mime)
         return deterministic + validate_ai_findings(review.content, candidates.findings, retrieved, deterministic, dimensions), "complete"
     except AIProviderError as exc:
@@ -1406,19 +1552,35 @@ async def visual_review(
     knowledge = db.scalars(select(Knowledge).where(Knowledge.organization_id == user.organization_id)).all()
     query = f"{role} logo palette colour contrast accessibility alt text {content}"
     from .retrieval import retrieve_approved
-    retrieved = retrieve_approved(db, user.organization_id, query)
+    organization = db.get(Organization, user.organization_id)
+    from .ai import embedding_space_for_config
+    external_guard = workspace_external_ai_guard(user.organization_id, organization.external_ai_consent_version)
+    openrouter_guard = workspace_openrouter_ai_guard(
+        user.organization_id, organization.external_ai_consent_version,
+        organization.openrouter_consent_version,
+    )
+    query_embedding = None
+    if organization.external_ai_enabled and organization.openrouter_free_ai_enabled:
+        try:
+            from .ai import embedding_provider_from_config
+            query_embedding = embedding_provider_from_config(consent_guard=openrouter_guard).embed_query(query, workspace_id=user.organization_id)
+        except Exception as exc:
+            logger.info("Visual semantic retrieval unavailable; using lexical retrieval (%s)", type(exc).__name__)
+    retrieved = retrieve_approved(db, user.organization_id, query, query_embedding,
+                                  embedding_space=embedding_space_for_config())
     ai_status = "disabled"
     ai_findings = []
-    organization = db.get(Organization, user.organization_id)
     if organization.external_ai_enabled:
-        if not settings.gemini_vision_model and not settings.vision_model and not settings.ai_model:
+        if not settings.openrouter_vision_model and not settings.gemini_vision_model:
             ai_status = "not_configured"
         elif not retrieved:
             ai_status = "no_sources"
         else:
             try:
                 from .ai import AIProviderError, provider_from_config
-                provider = provider_from_config()
+                provider = provider_from_config(allow_openrouter=organization.external_ai_enabled and organization.openrouter_free_ai_enabled,
+                                                external_consent_guard=external_guard,
+                                                openrouter_consent_guard=openrouter_guard)
                 mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}[suffix]
                 candidates = provider.analyse_image(data, mime, {"role": role, "alt_text": alt_text.strip()}, retrieved, reference, reference_mime)
                 ai_findings = validate_ai_findings(content, candidates.findings, retrieved, deterministic, dimensions)

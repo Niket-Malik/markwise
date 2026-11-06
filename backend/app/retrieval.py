@@ -40,6 +40,7 @@ def retrieve_approved(
     content: str,
     query_embedding: list[float] | None = None,
     limit: int = 8,
+    embedding_space: str | None = None,
 ) -> list[Knowledge]:
     active = db.scalars(
         select(Knowledge).where(Knowledge.organization_id == organization_id, Knowledge.status == "active").limit(1000)
@@ -54,6 +55,7 @@ def retrieve_approved(
                     Knowledge.organization_id == organization_id,
                     Knowledge.status == "active",
                     KnowledgeChunk.embedding.is_not(None),
+                    *(([KnowledgeChunk.embedding_space == embedding_space]) if embedding_space else []),
                 )
                 .order_by(KnowledgeChunk.embedding.cosine_distance(query_embedding))
                 .limit(limit * 2)

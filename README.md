@@ -27,7 +27,7 @@ The Round 1 proposal also describes broader future workflows such as slide-deck 
 | API | Python 3.12, FastAPI, Pydantic Settings |
 | Persistence | SQLAlchemy 2, Alembic, PostgreSQL, pgvector; SQLite is used for local exploration and automated backend tests |
 | Documents and images | pypdf, python-docx, pypdfium2, Tesseract OCR, Pillow |
-| AI | Gemini Interactions API for primary text/vision analysis; OpenAI-compatible API for secondary text/vision analysis and embeddings |
+| AI | OpenRouter free NVIDIA Nemotron Super VL for consented text/vision analysis; Gemini secondary; OpenRouter NVIDIA Nemotron Embed with a separately tagged 1536-D vector space |
 | File storage | Local filesystem or S3-compatible storage (including Supabase Storage S3) |
 | Runtime | Docker Compose for local services; Render Blueprint for prepared deployment |
 
@@ -40,7 +40,7 @@ markwise_app/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py                 # API, models, auth, review and dashboard routes
-│   │   ├── ai.py                   # Gemini/OpenAI adapters, retries and failover
+│   │   ├── ai.py                   # OpenRouter/Gemini adapters, bounded retries and failover
 │   │   ├── retrieval.py            # Approved-source retrieval
 │   │   ├── document_processing.py  # PDF, OCR and DOCX parsing
 │   │   ├── visual_analysis.py      # Local image and accessibility heuristics
@@ -86,7 +86,7 @@ Local `.env` files, uploaded content, local databases, dependency directories, a
 - Node.js 22 and npm for frontend development outside Docker.
 - Python 3.12 for backend development outside Docker.
 - Tesseract OCR for local scanned-document/image OCR. The backend Docker image installs Tesseract with English data.
-- Optional service accounts and credentials for Neon PostgreSQL, Supabase Storage S3, Gemini, and OpenAI. Live AI analysis requires working provider accounts, enabled models, and available quota.
+- Optional service accounts and credentials for Neon PostgreSQL, Supabase Storage S3, OpenRouter, and Gemini. Live AI analysis requires working provider accounts, enabled models, and available quota.
 
 ## Local development with Docker Compose
 
@@ -152,7 +152,7 @@ Neon is compatible with the SQLAlchemy/psycopg 3 configuration. Put the Neon poo
 DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
 ```
 
-This is a placeholder format, not a real connection string. The application and Alembic normalize PostgreSQL URLs to the `postgresql+psycopg` driver, use psycopg 3's non-prepared mode, and require TLS for remote PostgreSQL hosts. Keep the existing `vector(1536)` embedding column paired with OpenAI `text-embedding-3-small`; changing the embedding model/dimension requires a coordinated re-embedding and migration plan.
+This is a placeholder format, not a real connection string. The application and Alembic normalize PostgreSQL URLs to the `postgresql+psycopg` driver, use psycopg 3's non-prepared mode, and require TLS for remote PostgreSQL hosts. The existing `vector(1536)` schema is retained. OpenRouter Nemotron embeddings are truncated and normalized to 1536 dimensions, and migration 0007 tags the model space so existing OpenAI vectors are never compared against them. Migration 0008 adds separate workspace consent generations for general external AI and OpenRouter; revocation invalidates any stale in-flight operation before its next provider request. Requests already sent upstream cannot be cancelled. A failed backfill can be resumed by a workspace admin with `POST /api/settings/embeddings/backfill`; no automatic repeat job is scheduled.
 
 With the Python dependencies installed and `backend/.env` configured, run from the repository root:
 
@@ -182,27 +182,17 @@ Copy the endpoint and region from Supabase Project Settings → Storage → S3. 
 
 To test configured storage, run `python -m backend.app.storage_check` from the repository root. This makes a live upload, authenticated server-side download, anonymous-access denial check, and cleanup of a temporary probe object. It requires valid S3 settings and changes the bucket only by creating and deleting that probe object.
 
-## Gemini, OpenAI, retrieval, and failover
+## OpenRouter, Gemini, retrieval, and privacy
 
-The configured order is:
+OpenRouter is configured as the primary provider for consented workspaces using `nvidia/nemotron-3.5-super-vl:free` for text and image review. It uses the OpenAI-compatible Chat Completions endpoint with a strict JSON schema response and image input. The `nvidia/nemotron-3-ultra-550b-a55b:free` candidate is not used because its current model page says `response_format` JSON enforcement is unsupported. The selected Super VL model documents image input and JSON-schema output ([model capabilities](https://openrouter.ai/nvidia/nemotron-3.5-super-vl:free); [Ultra limitation](https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b:free)). Gemini (`gemini-3.8-flash` with `gemini-3.7-flash` alternate) is the secondary provider when configured. Provider/model retries are bounded; quota errors skip same-provider model alternatives, while temporary model errors may advance to a compatible alternate. Circuit cooldown and recovery are retained. If all providers fail, analysis remains incomplete and the existing Knowledge Base fallback is shown; Markwise does not fabricate citations or label that fallback as an AI success.
 
-| Use | Provider/model order |
-| --- | --- |
-| Text and vision primary | Gemini `gemini-3.8-flash` → `gemini-3.7-flash` |
-| Text and vision secondary | OpenAI `gpt-6-luna` → `gpt-5.6-luna` |
-| Embeddings | OpenAI `text-embedding-3-small`, 1536 dimensions |
+OpenRouter's free endpoints have changing availability and usage limits. Its current embedding-model page reports volatile provider availability, so semantic search degrades to the existing lexical retrieval if embedding service calls fail. Free provider processing may log prompts and use data to improve services. For that reason, an administrator must first enable external AI and then explicitly enable the separate OpenRouter free-provider consent in workspace settings. The provider explicitly warns not to submit confidential or personal information; do not opt in for such workspace content ([free endpoint terms and data notice](https://openrouter.ai/nvidia/nemotron-3.5-super-vl:free)). With that option off, Markwise uses configured Gemini only. Live AI provider availability and quota depend on the provider account and can change.
 
-Configure `AI_PROVIDER=gemini`, `GEMINI_API_KEY`, the four `GEMINI_*_MODEL*` settings, `AI_FALLBACK_PROVIDER=openai_compatible`, `AI_FALLBACK_API_BASE_URL`, `AI_FALLBACK_API_KEY`, the four `AI_FALLBACK_*_MODEL*` settings, `EMBEDDING_PROVIDER=openai_compatible`, and `EMBEDDING_MODEL=text-embedding-3-small`. The example files contain the exact keys and model defaults. A workspace admin must enable external AI in that workspace's privacy settings before content is sent to a provider. Gemini requests use the Interactions API with structured JSON output and `store=false`; the OpenAI-compatible adapter enforces a structured output schema.
-
-The review flow retrieves approved rules/facts from the same workspace, supplies that evidence to the model, validates returned citations against approved sources, and abstains with `CANNOT VERIFY` when the evidence does not support a claim. Provider/model fallback preserves that request context. Vision requests only use configured vision-capable models; the system does not silently substitute a text-only model.
-
-Temporary model-specific failures (such as timeouts, connection failures, and retryable 5xx responses) use bounded retries with exponential backoff, jitter, and `Retry-After`, then can try that provider's alternate model. A provider-level 429/quota response skips its alternate model and moves to the other provider because quota is commonly shared. Provider health uses an in-process circuit breaker and cooldown; a half-open request probes recovery so traffic can return to Gemini after it becomes healthy. Invalid credentials, malformed requests, and unsupported models are not retried indefinitely. If all providers fail, analysis reports a retryable failure and the submitted review is retained. Provider status is exposed to workspace admins without returning API keys or content.
-
-Live AI provider availability and quota depend on the configured API accounts, project limits, model access, and service health. Mocked tests do not prove live provider availability. Do not assume the optional external AI path will be available during a demo without checking account quota and configuration beforehand.
+Semantic embeddings use `nvidia/nemotron-3.5-embed-1b:free` ([model page](https://openrouter.ai/nvidia/nemotron-3.5-embed-1b:free); [NVIDIA API dimensions and input-type reference](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3_5-embed-1b-infer)) with `input_type=passage` when indexing and `input_type=query` for search. The embedding model is 2048-dimensional; Markwise requests/truncates to 1536 and normalizes the returned vector to preserve the existing PostgreSQL `vector(1536)` schema. Migration 0007 tags each embedding space so old OpenAI vectors are not mixed with new vectors. Opting into OpenRouter queues re-embedding of approved sources; lexical retrieval remains available until indexing completes. Markwise does not call OpenAI embeddings or silently mix embedding models.
 
 ## API endpoints and authentication
 
-The API docs at `/docs` expose the OpenAPI schema. Main application routes are:
+The API docs at `/docs` expose the OpenAPI schema. AI analysis/retry routes are limited to 10 requests per client IP per minute, and a shared per-process OpenRouter budget defaults to 15 upstream calls/minute across text, vision, retries, and embeddings. Production should add a shared edge/provider limiter across replicas. Main application routes are:
 
 | Area | Routes |
 | --- | --- |
@@ -248,7 +238,7 @@ The Node tests inspect the built production markup and stylesheet for labelled a
 `render.yaml` prepares a Render Blueprint with a Docker FastAPI web service, Docker Next.js web service, and daily retention cron job. It is a deployment configuration, not evidence of a live deployment. No public frontend/backend URL is currently verified.
 
 1. Connect the intended repository to Render and create the Blueprint from `render.yaml`.
-2. Set protected service values for Neon `DATABASE_URL` (with `sslmode=require` and `vector` enabled), Supabase S3 endpoint/bucket/region/access keys, `GEMINI_API_KEY`, and `AI_FALLBACK_API_KEY`. Render generates `SECRET_KEY`; do not put secrets in the repository or frontend settings.
+2. Set protected service values for Neon `DATABASE_URL` (with `sslmode=require` and `vector` enabled), Supabase S3 endpoint/bucket/region/access keys, `OPENROUTER_API_KEY`, and optional `GEMINI_API_KEY`. Render generates `SECRET_KEY`; do not put secrets in the repository or frontend settings.
 3. Confirm the backend `CORS_ORIGINS` exactly matches the actual HTTPS frontend origin. The Blueprint currently contains an example Render hostname; update it if Render assigns a different host. Verify the frontend's `NEXT_PUBLIC_API_HOST`/API URL points to the actual backend host.
 4. Deploy and inspect the build, Alembic pre-deploy migration, API `/health`, frontend HTTPS response, and cron logs. Verify the retention worker receives the required database and S3 settings.
 5. Use a dedicated test workspace to verify registration/login, role restrictions and workspace boundaries, private upload, admin-confirmed guideline import, AI consent, real analysis/citations, review decisions/history, dashboard data, retention deletion, and CORS. Run edge-level shared rate limiting, monitoring, backups, and HTTPS checks before inviting users.

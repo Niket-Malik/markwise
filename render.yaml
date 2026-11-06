@@ -35,7 +35,17 @@ services:
       - key: S3_SSE_KMS_KEY_ID
         value: ""
       - key: AI_PROVIDER
-        value: gemini
+        value: openrouter
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_API_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: OPENROUTER_TEXT_MODEL
+        value: nvidia/nemotron-3.5-super-vl:free
+      - key: OPENROUTER_VISION_MODEL
+        value: nvidia/nemotron-3.5-super-vl:free
+      - key: OPENROUTER_MAX_REQUESTS_PER_MINUTE
+        value: "15"
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_TEXT_MODEL
@@ -46,28 +56,16 @@ services:
         value: gemini-3.7-flash
       - key: GEMINI_VISION_MODEL_ALTERNATE
         value: gemini-3.7-flash
-      - key: AI_FALLBACK_PROVIDER
-        value: openai_compatible
-      - key: AI_FALLBACK_API_BASE_URL
-        value: https://api.openai.com/v1
-      - key: AI_FALLBACK_API_KEY
-        sync: false
-      - key: AI_FALLBACK_TEXT_MODEL
-        value: gpt-6-luna
-      - key: AI_FALLBACK_VISION_MODEL
-        value: gpt-6-luna
-      - key: AI_FALLBACK_TEXT_MODEL_ALTERNATE
-        value: gpt-5.6-luna
-      - key: AI_FALLBACK_VISION_MODEL_ALTERNATE
-        value: gpt-5.6-luna
       - key: EMBEDDING_PROVIDER
-        value: openai_compatible
+        value: openrouter
       - key: EMBEDDING_MODEL
-        value: text-embedding-3-small
+        value: nvidia/nemotron-3.5-embed-1b:free
+      - key: EMBEDDING_DIMENSIONS
+        value: "1536"
       - key: AI_TIMEOUT_SECONDS
         value: "45"
       - key: AI_PROVIDER_MAX_RETRIES
-        value: "2"
+        value: "1"
       - key: AI_RETRY_BASE_SECONDS
         value: "0.5"
       - key: AI_RETRY_MAX_SECONDS

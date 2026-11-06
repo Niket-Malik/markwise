@@ -11,16 +11,37 @@ from docx import Document
 from pypdf import PdfWriter
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from backend.app.main import Base, RateLimitMiddleware, app, configured_cors_origins, db_session, normalize_database_url
+import backend.app.main as main_module
+
+
+@pytest.fixture(autouse=True)
+def disable_live_service_credentials(monkeypatch):
+    # Test requests must never use credentials loaded from a developer's backend/.env.
+    from backend.app.main import settings
+    from backend.app.ai import reset_openrouter_rate_limiter_for_tests
+    reset_openrouter_rate_limiter_for_tests()
+    for name in ("openrouter_api_key", "gemini_api_key", "ai_api_key", "ai_fallback_api_key",
+                 "s3_access_key_id", "s3_secret_access_key"):
+        monkeypatch.setattr(settings, name, "")
+    monkeypatch.setattr(settings, "storage_backend", "local")
+    yield
+    reset_openrouter_rate_limiter_for_tests()
 
 
 @pytest.fixture()
-def client():
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+def client(monkeypatch, tmp_path_factory):
+    # File-backed SQLite allows consent guards to open an independent fresh
+    # connection while a request-scoped database session is still active.
+    database_dir = tmp_path_factory.mktemp("markwise-test-db")
+    engine = create_engine(f"sqlite:///{(database_dir / 'test.sqlite').as_posix()}",
+                           connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
+    # Consent guards intentionally use a fresh session factory for every provider call.
+    # Point that factory at this isolated test database.
+    monkeypatch.setattr(main_module, "SessionLocal", factory)
 
     def override_session():
         with factory() as session:
@@ -213,7 +234,8 @@ def test_external_analysis_requires_workspace_opt_in_and_validates_citations(cli
     rule = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Avoid guarantees", "body": "guaranteed", "source": "Voice guide", "passage": "Do not promise guaranteed outcomes."}).json()
     client.post(f"/api/knowledge/{rule['id']}/approve", headers=headers)
 
-    for name, value in (("ai_provider", "openai_compatible"), ("ai_api_key", "test-key-only"), ("ai_model", "test-model"), ("embedding_model", "")):
+    for name, value in (("ai_provider", "openrouter"), ("openrouter_api_key", "test-key-only"),
+                        ("openrouter_text_model", "nvidia/nemotron-3.5-super-vl:free"), ("embedding_model", "")):
         monkeypatch.setattr(main.settings, name, value)
     first = {"kind": "claim", "excerpt": "We cut onboarding by 60%, guaranteed", "explanation": "The cited study supports at most 40%.", "severity": "high", "confidence": 0.94, "cited_source_ids": [fact["id"]], "cannot_verify": False, "suggested_rewrite": "Customers reduced onboarding time by up to 40%.", "intent_preserved": True}
     legal = {"kind": "legal", "excerpt": "guaranteed", "explanation": "The approved rule prohibits guarantees.", "severity": "high", "confidence": 0.9, "cited_source_ids": [rule["id"]], "cannot_verify": False, "suggested_rewrite": None, "intent_preserved": False}
@@ -232,6 +254,9 @@ def test_external_analysis_requires_workspace_opt_in_and_validates_citations(cli
 
     consent = client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
     assert consent.json()["external_ai_enabled"] is True
+    monkeypatch.setattr(main, "backfill_knowledge_embeddings", lambda _org_id: None)
+    free_consent = client.put("/api/settings/privacy", headers=headers, json={"openrouter_free_ai_enabled": True})
+    assert free_consent.json()["openrouter_free_ai_enabled"] is True
     verified = client.post("/api/reviews", headers=headers, json={"title": "Grounded", "content": "We cut onboarding by 60%, guaranteed."}).json()
     assert verified["ai_status"] == "complete"
     claim = next(f for f in verified["findings"] if f["kind"] == "claim")
@@ -259,7 +284,7 @@ def test_ai_failure_runs_cited_knowledge_fallback_and_never_reports_clean(client
     client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
     monkeypatch.setattr(main.settings, "embedding_model", "")
 
-    def unavailable():
+    def unavailable(*, allow_openrouter=False):
         raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
 
     monkeypatch.setattr(ai, "provider_from_config", unavailable)
@@ -298,7 +323,7 @@ def test_successful_zero_finding_ai_analysis_is_the_only_clean_result(client, mo
             assert any(item.id == source["id"] for item in sources)
             return ai.AnalysisResponse(findings=[])
 
-    monkeypatch.setattr(ai, "provider_from_config", lambda: EmptyProvider())
+    monkeypatch.setattr(ai, "provider_from_config", lambda **_kwargs: EmptyProvider())
     response = client.post("/api/reviews", headers=headers, json={"title": "Clean draft", "content": "Our product supports thoughtful teams."})
     assert response.status_code == 200
     result = response.json()
@@ -318,7 +343,7 @@ def test_empty_knowledge_fallback_explicitly_cannot_verify(client, monkeypatch):
     client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
     monkeypatch.setattr(main.settings, "embedding_model", "")
 
-    def unavailable():
+    def unavailable(*, allow_openrouter=False):
         raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
 
     monkeypatch.setattr(ai, "provider_from_config", unavailable)
@@ -581,7 +606,7 @@ def test_manual_retry_recovers_ai_without_duplicate_review_or_findings(client, m
     client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
     monkeypatch.setattr(main.settings, "embedding_model", "")
 
-    def unavailable():
+    def unavailable(*, allow_openrouter=False):
         raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
 
     monkeypatch.setattr(ai, "provider_from_config", unavailable)
@@ -597,7 +622,7 @@ def test_manual_retry_recovers_ai_without_duplicate_review_or_findings(client, m
                 severity="high", confidence=0.9, cited_source_ids=[rule["id"]],
             )])
 
-    monkeypatch.setattr(ai, "provider_from_config", lambda: RecoveredProvider())
+    monkeypatch.setattr(ai, "provider_from_config", lambda **_kwargs: RecoveredProvider())
     retried = client.post(f"/api/reviews/{failed['id']}/retry-ai", headers=headers)
     assert retried.status_code == 200
     result = retried.json()
@@ -620,7 +645,7 @@ def test_failed_manual_retry_preserves_fallback_and_reports_cannot_verify(client
     client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
     monkeypatch.setattr(main.settings, "embedding_model", "")
 
-    def unavailable():
+    def unavailable(*, allow_openrouter=False):
         raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
 
     monkeypatch.setattr(ai, "provider_from_config", unavailable)
@@ -645,13 +670,16 @@ def test_ai_abstains_on_unsourced_nonpercentage_claim(client, monkeypatch):
     monkeypatch.setattr(main.settings, "ai_api_key", "test-key-only")
     monkeypatch.setattr(main.settings, "ai_model", "test-model")
     assert client.get("/api/settings/privacy", headers=headers).json()["ai_configured"] is False
-    for name, value in (("ai_provider", "openai_compatible"), ("ai_api_key", "test-key-only"), ("ai_model", "test-model"), ("embedding_model", "")):
+    for name, value in (("ai_provider", "openrouter"), ("openrouter_api_key", "test-key-only"),
+                        ("openrouter_text_model", "nvidia/nemotron-3.5-super-vl:free"), ("embedding_model", "")):
         monkeypatch.setattr(main.settings, name, value)
     client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main, "backfill_knowledge_embeddings", lambda _org_id: None)
+    assert client.put("/api/settings/privacy", headers=headers, json={"openrouter_free_ai_enabled": True}).status_code == 200
     candidate = {"kind": "claim", "excerpt": "Our service doubles your sales", "explanation": "The draft makes a factual performance claim.", "severity": "high", "confidence": 0.88, "cited_source_ids": [], "cannot_verify": True, "suggested_rewrite": None, "intent_preserved": False}
 
     def fake_post(url, headers, json: dict, timeout):
-        assert json["model"] == "test-model"
+        assert json["model"] == "nvidia/nemotron-3.5-super-vl:free"
         payload = json_module.loads(json["messages"][1]["content"])
         assert payload["approved_sources"] == []
         response = Mock()
@@ -940,7 +968,7 @@ def test_manual_image_retry_reuses_private_asset_without_duplicate_review(client
     monkeypatch.setattr(main.settings, "embedding_model", "")
     monkeypatch.setattr(main.settings, "vision_model", "vision-test")
 
-    def unavailable():
+    def unavailable(*, allow_openrouter=False):
         raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
 
     monkeypatch.setattr(ai, "provider_from_config", unavailable)
@@ -957,7 +985,7 @@ def test_manual_image_retry_reuses_private_asset_without_duplicate_review(client
             assert any(item.id == source["id"] for item in sources)
             return ai.AnalysisResponse(findings=[])
 
-    monkeypatch.setattr(ai, "provider_from_config", lambda: RecoveredVisionProvider())
+    monkeypatch.setattr(ai, "provider_from_config", lambda **_kwargs: RecoveredVisionProvider())
     retried = client.post(f"/api/reviews/{created['id']}/retry-ai", headers=headers)
     assert retried.status_code == 200
     assert retried.json()["ai_status"] == "complete"
@@ -969,14 +997,14 @@ def test_provider_status_is_admin_only_and_never_returns_credentials(client, mon
     import backend.app.main as main
     admin_token = register(client, "Provider Status Co", "provider-admin@example.test")
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
-    monkeypatch.setattr(main.settings, "ai_provider", "gemini")
+    monkeypatch.setattr(main.settings, "openrouter_api_key", "DO_NOT_RETURN_OPENROUTER_KEY")
     monkeypatch.setattr(main.settings, "gemini_api_key", "DO_NOT_RETURN_GEMINI_KEY")
-    monkeypatch.setattr(main.settings, "ai_fallback_api_key", "DO_NOT_RETURN_OPENAI_KEY")
     response = client.get("/api/settings/providers", headers=admin_headers)
     assert response.status_code == 200
-    assert response.json()["primary"] == "gemini"
+    assert response.json()["primary"] == "openrouter"
+    assert response.json()["fallback"] == "gemini"
     assert "DO_NOT_RETURN_GEMINI_KEY" not in response.text
-    assert "DO_NOT_RETURN_OPENAI_KEY" not in response.text
+    assert "DO_NOT_RETURN_OPENROUTER_KEY" not in response.text
     member = client.post("/api/team", headers=admin_headers, json={
         "name": "Reviewer", "email": "reviewer@example.test", "password": "long-test-password-123",
         "role": "reviewer",
@@ -993,3 +1021,175 @@ def test_z_auth_rate_limit(client):
     assert all(response.status_code == 401 for response in responses[:20])
     assert responses[-1].status_code == 429
     assert int(responses[-1].headers["Retry-After"]) > 0
+
+
+def test_openrouter_free_provider_requires_separate_admin_opt_in_and_clears_vectors(client, monkeypatch):
+    from backend.app import main
+    token = register(client, "Consent Co", "consent-admin@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "openrouter_api_key", "test-openrouter-key")
+    monkeypatch.setattr(main.settings, "gemini_api_key", "test-gemini-key")
+    monkeypatch.setattr(main, "backfill_knowledge_embeddings", lambda _org_id: None)
+    initial = client.get("/api/settings/privacy", headers=headers).json()
+    assert initial["external_ai_enabled"] is False
+    assert initial["openrouter_free_ai_enabled"] is False
+    assert initial["provider_status"] is not None
+    response = client.put("/api/settings/privacy", headers=headers, json={"openrouter_free_ai_enabled": True})
+    assert response.status_code == 409
+    assert client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True}).status_code == 200
+    enabled = client.put("/api/settings/privacy", headers=headers, json={"openrouter_free_ai_enabled": True})
+    assert enabled.status_code == 200
+    assert enabled.json()["openrouter_free_ai_enabled"] is True
+    # Turning off external AI also revokes the more specific consent.
+    disabled = client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": False})
+    assert disabled.status_code == 200
+    assert disabled.json()["openrouter_free_ai_enabled"] is False
+    with client.session_factory() as db:
+        organization = db.query(main.Organization).filter_by(name="Consent Co").one()
+        assert organization.external_ai_consent_version == 2
+        assert organization.openrouter_consent_version == 3
+
+
+def test_openrouter_free_provider_setting_is_admin_only(client):
+    admin_token = register(client, "Role Co", "role-admin@example.test")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    member = client.post("/api/team", headers=admin_headers, json={
+        "email": "reviewer@example.test", "name": "Reviewer", "role": "reviewer", "password": "reviewer-password-123"
+    })
+    assert member.status_code == 200
+    login = client.post("/api/auth/login", json={"email": "reviewer@example.test", "password": "reviewer-password-123"})
+    assert login.status_code == 200
+    response = client.put("/api/settings/privacy", headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+                          json={"openrouter_free_ai_enabled": True})
+    assert response.status_code == 403
+
+
+def test_ai_analysis_routes_have_a_low_quota_request_budget(client):
+    responses = [client.post("/api/reviews", json={"title": "No auth", "content": "A draft body."}) for _ in range(11)]
+    codes = [response.status_code for response in responses]
+    assert all(code in {401, 403} for code in codes[:10]), codes
+    assert codes[-1] == 429, codes
+    assert 1 <= int(responses[-1].headers["Retry-After"]) <= 60
+
+
+def test_openrouter_consent_withdrawn_between_embedding_and_analysis_blocks_ai(client, monkeypatch):
+    import backend.app.ai as ai
+    from backend.app.main import Organization
+
+    token = register(client, "Consent Race Co", "consent-race@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    source = client.post("/api/knowledge", headers=headers, json={
+        "kind": "fact", "title": "Approved claim", "body": "The product supports teams.",
+        "source": "Product guide", "passage": "Supports teams."
+    }).json()
+    client.post(f"/api/knowledge/{source['id']}/approve", headers=headers)
+    monkeypatch.setattr(main_module, "backfill_knowledge_embeddings", lambda _org_id: None)
+    assert client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True}).status_code == 200
+    assert client.put("/api/settings/privacy", headers=headers, json={"openrouter_free_ai_enabled": True}).status_code == 200
+    monkeypatch.setattr(main_module.settings, "openrouter_api_key", "test-openrouter")
+    monkeypatch.setattr(main_module.settings, "gemini_api_key", "")
+    calls = []
+
+    def fake_request(provider, url, **kwargs):
+        calls.append(kwargs.get("operation"))
+        assert provider == "openrouter" and url.endswith("/embeddings")
+        with client.session_factory() as consent_db:
+            organization = consent_db.get(Organization, 1)
+            organization.openrouter_free_ai_enabled = False
+            organization.openrouter_consent_version += 1
+            consent_db.commit()
+        return {"data": [{"index": 0, "embedding": [1.0] + [0.0] * 1535}]}
+
+    monkeypatch.setattr(ai, "_request", fake_request)
+    response = client.post("/api/reviews", headers=headers, json={
+        "title": "Consent interrupted", "content": "Our product supports teams."
+    })
+    assert response.status_code == 200
+    assert response.json()["ai_status"] == "error"
+    assert response.json()["clean_review"] is False
+    assert calls == ["embed_query"]
+    persisted = client.get("/api/reviews", headers=headers)
+    assert persisted.status_code == 200
+    saved = next(review for review in persisted.json() if review["id"] == response.json()["id"])
+    assert saved["content"] == "Our product supports teams."
+
+
+def test_inconsistent_consent_flags_never_send_visual_embedding(client, monkeypatch, tmp_path):
+    import io
+    from PIL import Image
+    import backend.app.ai as ai
+    from backend.app.main import Organization
+
+    token = register(client, "Inconsistent Consent Co", "inconsistent-consent@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main_module.settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr(main_module.settings, "openrouter_api_key", "test-openrouter")
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "Visual content")
+    monkeypatch.setattr("pytesseract.image_to_data", lambda *args, **kwargs: {"text": [], "conf": [], "left": [], "top": [], "width": [], "height": []})
+    with client.session_factory() as db:
+        organization = db.query(Organization).filter_by(name="Inconsistent Consent Co").one()
+        organization.external_ai_enabled = False
+        organization.openrouter_free_ai_enabled = True
+        organization.openrouter_consent_version += 1
+        db.commit()
+    requests = []
+    monkeypatch.setattr(ai, "_request", lambda *args, **kwargs: requests.append(args))
+    image = Image.new("RGB", (40, 40), "blue")
+    buffer = io.BytesIO(); image.save(buffer, format="PNG")
+    response = client.post("/api/visual-reviews", headers=headers,
+                           data={"role": "informative", "alt_text": "A blue image"},
+                           files={"file": ("visual.png", buffer.getvalue(), "image/png")})
+    assert response.status_code == 200
+    assert response.json()["ai_status"] == "disabled"
+    assert requests == []
+
+
+def test_embedding_backfill_pauses_and_manually_resumes_without_duplicate_or_mixed_rows(client, monkeypatch):
+    import backend.app.ai as ai
+    from backend.app.main import KnowledgeChunk, Organization
+
+    token = register(client, "Resume Backfill Co", "resume-backfill@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    item = client.post("/api/knowledge", headers=headers, json={
+        "kind": "rule", "title": "Clear language", "body": "Use plain language.",
+        "source": "Guide", "passage": "Keep instructions clear."
+    }).json()
+    assert client.post(f"/api/knowledge/{item['id']}/approve", headers=headers).status_code == 200
+    real_backfill = main_module.backfill_knowledge_embeddings
+    monkeypatch.setattr(main_module, "backfill_knowledge_embeddings", lambda _org_id: None)
+    assert client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True}).status_code == 200
+    assert client.put("/api/settings/privacy", headers=headers, json={"openrouter_free_ai_enabled": True}).status_code == 200
+    monkeypatch.setattr(main_module.settings, "openrouter_api_key", "test-openrouter")
+    monkeypatch.setattr(main_module, "backfill_knowledge_embeddings", real_backfill)
+    with client.session_factory() as db:
+        organization_id = db.query(Organization).filter_by(name="Resume Backfill Co").one().id
+    with client.session_factory() as db:
+        before = db.query(KnowledgeChunk).filter_by(organization_id=organization_id).all()
+        chunk_ids = [chunk.id for chunk in before]
+        assert chunk_ids and all(chunk.embedding is None for chunk in before)
+
+    requests = []
+    def fail_once(provider, url, **kwargs):
+        requests.append(kwargs.get("operation"))
+        raise ai.ProviderRequestError("openrouter", "temporary failure", False)
+    monkeypatch.setattr(ai, "_request", fail_once)
+    real_backfill(organization_id)
+    assert requests == ["embed_passage"]
+    with client.session_factory() as db:
+        assert db.query(KnowledgeChunk).filter_by(organization_id=organization_id).count() == len(chunk_ids)
+        assert all(chunk.embedding is None for chunk in db.query(KnowledgeChunk).filter_by(organization_id=organization_id).all())
+
+    def succeed(provider, url, **kwargs):
+        requests.append(kwargs.get("operation"))
+        vectors = [[1.0] + [0.0] * 1535 for _ in kwargs["payload"]["input"]]
+        return {"data": [{"index": index, "embedding": vector} for index, vector in enumerate(vectors)]}
+    monkeypatch.setattr(ai, "_request", succeed)
+    resumed = client.post("/api/settings/embeddings/backfill", headers=headers)
+    assert resumed.status_code == 200 and resumed.json()["status"] == "queued"
+    from backend.app.ai import embedding_space_for_config
+    with client.session_factory() as db:
+        after = db.query(KnowledgeChunk).filter_by(organization_id=organization_id).all()
+        assert [chunk.id for chunk in after] == chunk_ids
+        assert all(chunk.embedding is not None and len(chunk.embedding) == 1536 for chunk in after)
+        assert all(chunk.embedding_space == embedding_space_for_config() for chunk in after)
+    assert requests == ["embed_passage", "embed_passage"]

@@ -6,17 +6,17 @@ Items are marked done only to the level tested locally. External-service and pub
 
 ### Phase 1 — AI and grounded review
 
-- [x] Gemini-first text and vision adapters with OpenAI secondary models, workspace consent gating, source grounding, citations, CANNOT VERIFY, and guarded suggestions.
+- [x] Consent-gated OpenRouter free text/vision adapter with Gemini secondary, source grounding, citations, CANNOT VERIFY, and guarded suggestions. OpenAI is not called by the configured free stack.
 - [x] Bounded 429/quota/5xx/timeout/connection retries, exponential jitter with Retry-After, provider circuit cooldown/recovery, capability-aware image failover, safe logs, and admin-visible provider status.
-- [x] Provider-internal model order: Gemini `gemini-3.8-flash` → `gemini-3.7-flash`; OpenAI `gpt-6-luna` → `gpt-5.6-luna`. Temporary model errors can try same-provider alternate; 429/quota skips the alternate and changes provider.
-- [x] Model-level tests cover Gemini primary-to-alternate, Gemini quota-to-OpenAI, OpenAI primary-to-alternate, OpenAI quota skipping its alternate, strict JSON schema on text/image calls, and fail-closed vision capability checks.
-- [x] Preserve OpenAI `text-embedding-3-small` vectors at 1536 dimensions; no schema or stored vector-space change.
+- [x] Model order: OpenRouter `nvidia/nemotron-3.5-super-vl:free` → Gemini `gemini-3.8-flash` / `gemini-3.7-flash`. HTTP 429/quota skips same-provider alternates; temporary model errors use only compatible model alternatives.
+- [x] Mock tests cover OpenRouter text/vision strict JSON, model capability guard, embeddings, 1536 dimensions, workspace cache scope/revocation, OpenRouter quota-to-Gemini, and existing bounded retry/circuit behavior.
+- [x] Use OpenRouter Nemotron Embed requested at 1536 dimensions; preserve the pgvector schema and tag model spaces with forward migration 0007. Existing OpenAI vectors are ignored and re-embedded only after explicit workspace consent.
 - [x] Approved-source chunking, pgvector cosine retrieval, lexical fallback, embedding backfill, and cleanup on consent withdrawal.
 - [x] Validate source IDs and exact excerpts (or bounded image regions); validate citations; explicitly abstain as `CANNOT VERIFY` when evidence is missing.
 - [x] Ask opted-in AI to identify claims even when retrieval returns no matching source, and validate abstentions without adding invented citations.
 - [x] Guard suggestions for intent preservation and supported numeric claims.
-- [ ] Complete a successful live Gemini/OpenAI analysis and 1536-dimensional OpenAI embedding check. Probe attempted 2026-11-06: Gemini model metadata access passed (HTTP 200), generation returned 503 for text and image; OpenAI returned 429 quota exhaustion for text, image, and embeddings. Simulated Gemini outage did route to OpenAI, but secondary quota blocked completion. See PROJECT_STATUS.md.
-- [x] Resolved backend settings now use `gpt-6-luna` → `gpt-5.6-luna` and `gemini-3.8-flash` → `gemini-3.7-flash`; no credential values were read or changed.
+- [ ] Make a quota-safe live verification of OpenRouter/Gemini text/vision and OpenRouter embeddings when the owner authorizes it and provider capacity is available. No live calls were made during the free-stack change.
+- [x] Added OpenRouter API/model configuration and optional Gemini model/fallback configuration to templates/Render Blueprint; local `backend/.env` was not modified.
 - [x] Configure backend/.env loading for local runtime/Alembic; enforce TLS for remote PostgreSQL and use psycopg 3 with Neon pooler-safe migration settings.
 - [x] Connect to Neon from backend/.env over TLS; apply Alembic through 0005, verify all 12 tables, pgvector 0.8.6, vector(1536), cosine HNSW index, and no Alembic drift.
 
@@ -41,15 +41,15 @@ Items are marked done only to the level tested locally. External-service and pub
 - [x] Add Supabase Storage S3 Signature V4/path-style support, private server-side get helper, and a temporary upload/download/anonymous-access/cleanup probe command.
 - [x] Verify configured Supabase S3 connectivity, upload, authenticated download, anonymous access denial, and post-delete absence using a temporary object; credentials remain in ignored backend/.env.
 - [ ] Verify storage deletion, backups, and scheduled purge against the real service; add job monitoring.
-- [ ] Add shared ingress rate limiting and complete the session, proxy-trust, secrets, logging, and security review.
+- [ ] Add shared ingress/provider rate limiting across replicas (current AI endpoint limit is 10/min/client IP and OpenRouter budget is 15/min/process) and complete the session, proxy-trust, secrets, logging, and security review.
 
 ### Phase 4 — Insights, accessibility, and tests
 
 - [x] Dashboard reports real review/finding counts, recurring unsupported claims, dismissed decisions, and contested rules.
 - [x] Keyboard login navigation inspected; CSS text contrast values were statically checked against the application’s light backgrounds.
-- [x] AI failover adapter tests: 20 passed, including text and vision alternates, provider-level 429 skip behavior, strict JSON schema, and fail-closed image capability.
-- [x] Quota-safe final run: complete backend suite 39 passed using SQLite and mocks with the provider disabled; 0 live API calls.
-- [x] Re-run frontend tests (4 passed) and Next.js production build after provider changes (no frontend code changed during the final quota-safe verification).
+- [x] Free-stack mocked tests exercise OpenRouter text/vision/embedding and Gemini fallback paths; final suite results below.
+- [x] Free-stack verification: backend suite 68 passed with SQLite/mocks, frontend tests 6 passed and production build succeeded; zero live AI calls.
+- [x] Frontend privacy opt-in UI, tests (6 passed) and Next.js production build verified.
 - [ ] Add interactive frontend end-to-end workflow and automated accessibility tests.
 - [ ] Expand backend security and PostgreSQL integration tests; complete a manual assistive-technology and responsive accessibility review.
 
