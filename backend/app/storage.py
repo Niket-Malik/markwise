@@ -13,6 +13,30 @@ def _safe_filename(filename: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", Path(filename).name)[:180] or "upload"
 
 
+def _s3_client(config: Settings):
+    if not config.s3_bucket or not config.s3_access_key_id or not config.s3_secret_access_key:
+        raise RuntimeError("S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY are required for S3 storage")
+    if _is_supabase_storage(config) and urlparse(config.s3_endpoint_url).scheme != "https":
+        raise RuntimeError("Supabase Storage S3 endpoint must use HTTPS")
+    import boto3
+    from botocore.config import Config
+
+    # Supabase requires path-style requests and Signature V4 for its S3 endpoint.
+    return boto3.client(
+        "s3", endpoint_url=config.s3_endpoint_url or None, region_name=config.s3_region,
+        aws_access_key_id=config.s3_access_key_id, aws_secret_access_key=config.s3_secret_access_key,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def _is_supabase_storage(config: Settings) -> bool:
+    parsed = urlparse(config.s3_endpoint_url)
+    host = parsed.hostname or ""
+    return host.endswith(".storage.supabase.co") or (
+        host.endswith(".supabase.co") and parsed.path.rstrip("/").endswith("/storage/v1/s3")
+    )
+
+
 def put_object(org_id: int, object_id: str, filename: str, payload: bytes, config: Settings = settings) -> str:
     """Persist a file and return its opaque object key for database tracking."""
     key = f"{org_id}/{object_id}-{_safe_filename(filename)}"
@@ -24,22 +48,19 @@ def put_object(org_id: int, object_id: str, filename: str, payload: bytes, confi
         return f"local:{target}"
     if backend != "s3":
         raise RuntimeError("STORAGE_BACKEND must be local or s3")
-    if not config.s3_bucket or not config.s3_access_key_id or not config.s3_secret_access_key:
-        raise RuntimeError("S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY are required for S3 storage")
-    import boto3
-
-    client = boto3.client(
-        "s3", endpoint_url=config.s3_endpoint_url or None, region_name=config.s3_region,
-        aws_access_key_id=config.s3_access_key_id, aws_secret_access_key=config.s3_secret_access_key,
-    )
+    client = _s3_client(config)
     put_args = {"Bucket": config.s3_bucket, "Key": key, "Body": payload}
     encryption = config.s3_server_side_encryption.strip()
     endpoint_host = urlparse(config.s3_endpoint_url).hostname or ""
     is_cloudflare_r2 = endpoint_host.endswith(".r2.cloudflarestorage.com")
+    is_supabase = _is_supabase_storage(config)
     if is_cloudflare_r2 and encryption == "aws:kms":
         raise RuntimeError("Cloudflare R2 uses managed encryption at rest and does not support AWS KMS headers")
+    if is_supabase and encryption == "aws:kms":
+        raise RuntimeError("Supabase Storage S3 does not support AWS SSE-KMS headers")
     # R2 encrypts every object at rest itself; its S3 API rejects PutObject SSE headers.
-    if is_cloudflare_r2:
+    # Supabase Storage's S3 API also rejects SSE headers; leave encryption to the service.
+    if is_cloudflare_r2 or is_supabase:
         encryption = ""
     if encryption:
         if encryption not in {"AES256", "aws:kms"}:
@@ -66,10 +87,26 @@ def delete_object(storage_key: str, config: Settings = settings) -> None:
             raise RuntimeError("S3 credentials are required to delete this stored object")
         import boto3
 
-        client = boto3.client(
-            "s3", endpoint_url=config.s3_endpoint_url or None, region_name=config.s3_region,
-            aws_access_key_id=config.s3_access_key_id, aws_secret_access_key=config.s3_secret_access_key,
-        )
+        client = _s3_client(config)
         client.delete_object(Bucket=config.s3_bucket, Key=storage_key[3:])
         return
+    raise RuntimeError("Stored object provider does not match current storage configuration")
+
+
+def get_object(storage_key: str, config: Settings = settings) -> bytes:
+    """Read an object for server-side processing; never expose a public object URL."""
+    if storage_key.startswith("local:"):
+        path = Path(storage_key[6:]).resolve()
+        root = Path(config.upload_dir).resolve()
+        if root not in path.parents:
+            raise RuntimeError("Stored local object is outside the configured upload directory")
+        return path.read_bytes()
+    if storage_key.startswith("s3:"):
+        client = _s3_client(config)
+        response = client.get_object(Bucket=config.s3_bucket, Key=storage_key[3:])
+        body = response["Body"]
+        try:
+            return body.read()
+        finally:
+            body.close()
     raise RuntimeError("Stored object provider does not match current storage configuration")

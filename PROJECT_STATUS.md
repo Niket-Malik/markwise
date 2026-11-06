@@ -7,11 +7,12 @@ Work continues in the existing FastAPI, SQLAlchemy/Alembic, PostgreSQL/pgvector,
 ## Implemented
 
 - Workspace-scoped accounts, roles, review assignments, decisions, comments, content versions, audit events, and admin-confirmed knowledge.
-- OpenAI-compatible chat, vision, and embedding adapters; external AI is workspace opt-in. Approved-source chunks can be semantically retrieved through pgvector on PostgreSQL (lexical fallback otherwise). Provider findings must cite retrieved workspace source IDs and exact excerpts or in-bounds image regions; unsupported claims can abstain as `CANNOT VERIFY`. Suggestions are guarded to preserve intent and supported numeric claims.
+- Gemini model order `gemini-3.8-flash` → `gemini-3.7-flash`; OpenAI model order `gpt-6-luna` → `gpt-5.6-luna`. Temporary model failures can use the same-provider alternate. HTTP 429/quota skips the alternate and routes to the other provider. OpenAI `text-embedding-3-small` remains the dedicated 1536-dimensional embedding model. External AI stays workspace opt-in. Approved-source chunks can be retrieved through pgvector on PostgreSQL (lexical fallback otherwise). Provider findings must cite retrieved source IDs and exact excerpts or in-bounds image regions; unsupported claims can abstain as `CANNOT VERIFY`; suggestions retain citation and intent validation.
+- AI provider calls use bounded retries, exponential backoff with jitter and Retry-After, 429/quota/5xx/timeout/connection classification, per-process circuit cooldown and half-open recovery, capability checks for image failover, credential-free structured logs, and retryable user-facing failure status. Provider health is exposed to authenticated workspace settings and an admin-only status route.
 - When an opted-in text review has no matching source, AI can still inspect for factual claims; validated unsupported claims are explicitly marked `CANNOT VERIFY`. The review disclosure distinguishes this from a grounded source match.
 - PDF and DOCX parsing, scanned PDF and image OCR using Tesseract, pending imported guideline passages, and source document storage.
 - Image review with optional vision provider, optional user-supplied logo reference, palette sampling, OCR-derived contrast estimates, and alt-text checks. Heuristic measurements are disclosed as estimates, not definitive accessibility certification.
-- Local or S3-compatible storage adapter; upload and review retention settings; Compose retention worker; review deletion and reasoned finding decisions. AWS S3 writes default to AES256 server-side encryption and support KMS; Cloudflare R2 uses managed encryption and receives no unsupported SSE headers. Audit history is preserved through content purge.
+- Local or S3-compatible storage adapter; upload and review retention settings; Compose retention worker; review deletion and reasoned finding decisions. AWS S3 writes default to AES256 server-side encryption and support KMS; Cloudflare R2 and Supabase Storage omit unsupported SSE headers. Audit history is preserved through content purge.
 - File type signatures are checked before storage/OCR; DOCX decompression, upload size, pixel count, and visual-reference limits are bounded.
 - PDF/DOCX extracted text now populates the draft field so users can continue through the review workflow.
 - Applying a source-validated text suggestion replaces a unique flagged span only, saves a review version, preserves prior finding reasons, and re-runs analysis. Ambiguous repeated spans and non-rewrite/CANNOT VERIFY findings cannot be applied as edits.
@@ -22,7 +23,13 @@ Work continues in the existing FastAPI, SQLAlchemy/Alembic, PostgreSQL/pgvector,
 
 ## Verification completed in this workspace
 
-- Backend integration suite: **17 passed** using in-memory SQLite and mocked AI/storage; the run explicitly set `DATABASE_URL=sqlite://`, so tests did not connect to or modify Neon.
+- AI model/provider failover tests: **20 passed** with mocked provider responses. Live generation/embedding attempts and their transient service/quota failures are recorded below. No environment file values are included in this status.
+- Full backend suite: **39 passed** using SQLite and mocked provider/storage calls, with a test-only `SECRET_KEY` and local loopback access. Frontend tests: **4 passed**; Next.js production build passed. These do not constitute live AI or Neon service verification.
+- Live provider probe (2026-11-06): Gemini model metadata access returned HTTP 200, but both text and image generation returned HTTP 503. OpenAI text, image, and embedding requests returned HTTP 429 classified from whitelisted error fields as quota exhaustion. Simulated Gemini transient failure correctly routed a live request to OpenAI, which was also blocked by quota. No live analysis or embedding vector was produced; no credentials or response bodies were printed. Both keys are configured in backend/.env (presence only checked).
+- Quota-safe verification (2026-11-06): resolved local model settings match both requested primary/alternate orders; all four IDs pass the application's model/capability allowlists. Gemini/OpenAI keys are present (presence only); OpenAI embeddings remain `text-embedding-3-small` and the metadata column remains `vector(1536)`. No live requests were made in this verification because the prior probe found Gemini generation 503 and OpenAI quota exhaustion 429.
+- Quota-safe final verification (2026-11-06): **20 model/failover tests passed** and the complete backend suite passed **39 tests** with SQLite, provider disabled in the test process, and mocked provider/storage calls. Zero live API requests were made. Model capability allowlists passed for all four models, and `vector(1536)` metadata plus OpenAI `text-embedding-3-small` were confirmed without a database connection.
+
+- Earlier backend integration baseline: **18 passed** using in-memory SQLite and mocked AI/storage; the current full suite has since passed 35 tests and did not connect to or modify Neon.
 - Frontend production build and four Node-based production artifact smoke/accessibility checks passed. These are not interactive browser end-to-end tests.
 - Python compile passed. SQLite Alembic upgrade and drift checks passed on an isolated temporary database.
 - Neon connection was verified from `backend/.env` using SQLAlchemy 2.0.40, psycopg 3.2.6, and TLS (`sslmode=require`); psycopg/libpq confirmed the active client socket is encrypted. A read-only `SELECT 1` succeeded.
@@ -32,12 +39,12 @@ Work continues in the existing FastAPI, SQLAlchemy/Alembic, PostgreSQL/pgvector,
 
 ## Outstanding mandatory work / external blockers
 
-- Live provider-backed AI/vision/embedding and object storage workflows remain unverified in this round. Keep them marked open until exercised using real configured services.
+- Live provider-backed AI/vision/embedding workflows remain unverified. The Supabase Storage probe has been run against the configured private bucket and verified upload, download, anonymous denial, and post-delete absence.
 - OCR depends on Tesseract; actual scanned document OCR needs verification in the deployment image or configured host.
 - Automated frontend checks are build-artifact checks, not interactive browser workflows or full assistive-technology review.
-- Security review remains incomplete: process-local rate limiting needs a shared edge limit in production; verify session lifecycle, proxy trust, storage policy, backups, logging, and retention operations.
+- Security review remains incomplete: process-local rate limiting needs a shared edge limit in production; verify session lifecycle, proxy trust, storage retention, backups, logging, and operational monitoring.
 - Docker Compose startup cannot be verified because Docker/Compose is unavailable in the environment.
-- No public host, storage bucket, deployment authorization, HTTPS monitoring, or verified live URL is available.
+- No public host, deployment authorization, HTTPS monitoring, or verified live URL is available; Supabase Storage is configured and its probe passed.
 
 See [TODO.md](TODO.md), [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md), and [DEPLOYMENT.md](DEPLOYMENT.md). Do not treat mocked or SQLite-only tests as live-service verification.
 
@@ -45,8 +52,8 @@ See [TODO.md](TODO.md), [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.m
 ## Deployment preparation (not a live deployment)
 
 - Added `render.yaml` for Render API/frontend Docker services, pre-deploy Alembic migration, HTTPS health endpoint, and daily retention cron; frontend resolves its API host from Render service metadata.
-- Neon URL normalization, TLS enforcement for remote PostgreSQL, pooler-safe psycopg settings, and Cloudflare R2 encryption compatibility are implemented.
-- No public service was deployed. This workspace has no Git remote, Render authorization, R2 credentials, or Docker CLI. No live URLs or managed-service checks are claimed.
+- Neon URL normalization, TLS enforcement for remote PostgreSQL, pooler-safe psycopg settings, and Supabase Storage S3 configuration are implemented; live Supabase connectivity and private-bucket lifecycle probe passed.
+- No public service was deployed. Render authorization and Docker CLI are unavailable. The Git remote exists, but its visibility is unknown. No live URLs or managed-service checks are claimed.
 
 ## Neon integration (verified)
 
@@ -57,7 +64,15 @@ See [TODO.md](TODO.md), [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.m
 
 ## GitHub push preparation
 
-- Git was initialized locally on branch `main`; there are no commits or remotes.
-- The reviewed deployment/source tree is staged locally as 41 files. A high-confidence credential-pattern scan of all staged files found no credentials; no Git history exists to audit. The scan suppressed all matched values.
+- Git branch `main` has an `origin/main` upstream and one reachable commit; this task did not create a commit or push. The remote visibility/ownership remains unverified.
+- The current `origin/main` tree has 41 files. A secret-pattern scan of that history found no high-confidence credential patterns; five database-URL matches were test placeholders only. Current uncommitted Supabase storage changes remain in the working tree. All matched values were suppressed.
 - `.gitignore` excludes environment files (while allowing `.env.example` templates), uploads, local databases/backups, credentials/key material, developer environments, and generated build/test output.
-- Nothing has been committed, pushed, or published. A remote and explicit user approval are required before publishing.
+- No commit or push was made during this storage task. The existing remote’s visibility/ownership is not verified; do not publish more changes without explicit approval.
+
+
+## Supabase Storage integration (live probe verified)
+
+- Supabase Storage S3 is configured in code with Signature V4, path-style requests, HTTPS-only endpoint validation, and no SSE headers. Added server-side `get_object` and a temporary connectivity probe covering upload, download, anonymous public-access denial, and cleanup.
+- `backend/.env` remains private and was not modified by this task. Configuration presence was checked without printing values.
+- Backend tests: **18 passed** using in-memory SQLite and mocked S3; compileall and Render/Compose YAML parsing passed. The live Supabase probe passed upload, authenticated download, anonymous access denial, and HeadObject confirmation that the temporary key was absent after deletion.
+- The existing app had no presigned URL generator or object download route. The new probe uses private server-side S3 GetObject and creates no signed/public URL.

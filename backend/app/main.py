@@ -56,7 +56,25 @@ class Settings(BaseSettings):
     ai_model: str = ""
     vision_model: str = ""
     embedding_model: str = ""
+    gemini_api_key: str = ""
+    gemini_text_model: str = "gemini-3.8-flash"
+    gemini_vision_model: str = "gemini-3.8-flash"
+    gemini_text_model_alternate: str = "gemini-3.7-flash"
+    gemini_vision_model_alternate: str = "gemini-3.7-flash"
+    ai_fallback_provider: str = "openai_compatible"
+    ai_fallback_api_base_url: str = "https://api.openai.com/v1"
+    ai_fallback_api_key: str = ""
+    ai_fallback_text_model: str = "gpt-6-luna"
+    ai_fallback_vision_model: str = "gpt-6-luna"
+    ai_fallback_text_model_alternate: str = "gpt-5.6-luna"
+    ai_fallback_vision_model_alternate: str = "gpt-5.6-luna"
+    embedding_provider: str = "openai_compatible"
     ai_timeout_seconds: float = 30
+    ai_provider_max_retries: int = 2
+    ai_retry_base_seconds: float = 0.5
+    ai_retry_max_seconds: float = 4
+    ai_circuit_breaker_failures: int = 3
+    ai_circuit_breaker_cooldown_seconds: int = 60
     ocr_language: str = "eng"
 
 
@@ -444,7 +462,7 @@ def remove_review_records(db: Session, review: Review):
 @app.get("/health")
 def health(db: Session = Depends(db_session)):
     db.execute(select(1))
-    return {"status": "ok", "database": "connected", "ai_configured": bool(settings.ai_provider and settings.ai_api_key)}
+    return {"status": "ok", "database": "connected", "ai_configured": bool(settings.ai_provider == "gemini" and settings.gemini_api_key)}
 
 
 @app.post("/api/auth/register")
@@ -492,19 +510,23 @@ def create_team_member(data: TeamMemberIn, user: User = Depends(roles("admin")),
 
 @app.get("/api/settings/privacy")
 def get_privacy_settings(user: User = Depends(current_user), db: Session = Depends(db_session)):
+    from .ai import provider_status
     organization = db.get(Organization, user.organization_id)
-    provider_configured = settings.ai_provider.strip().lower() in {"openai", "openai_compatible"} and bool(settings.ai_api_key)
+    provider_configured = settings.ai_provider.strip().lower() in {"gemini", "google_gemini"} and bool(settings.gemini_api_key)
+    fallback_configured = settings.ai_fallback_provider.strip().lower() in {"openai", "openai_compatible"} and bool(settings.ai_fallback_api_key or settings.ai_api_key)
     semantic_chunks = db.scalar(select(func.count(KnowledgeChunk.id)).where(
         KnowledgeChunk.organization_id == user.organization_id, KnowledgeChunk.embedding.is_not(None)
     )) or 0
     return {
         "external_ai_enabled": organization.external_ai_enabled,
         "provider": settings.ai_provider or None,
-        "model": settings.ai_model or None,
-        "vision_model": settings.vision_model or settings.ai_model or None,
-        "ai_configured": bool(provider_configured and settings.ai_model),
-        "vision_configured": bool(provider_configured and (settings.vision_model or settings.ai_model)),
-        "embeddings_configured": bool(provider_configured and settings.embedding_model),
+        "model": settings.gemini_text_model if provider_configured else None,
+        "vision_model": settings.gemini_vision_model if provider_configured else None,
+        "ai_configured": bool(provider_configured and settings.gemini_text_model and fallback_configured),
+        "vision_configured": bool(provider_configured and settings.gemini_vision_model and fallback_configured),
+        "embeddings_configured": bool(fallback_configured and settings.embedding_model == "text-embedding-3-small"),
+        "fallback_provider": settings.ai_fallback_provider if fallback_configured else None,
+        "provider_status": provider_status(),
         "semantic_chunks": semantic_chunks,
     }
 
@@ -520,18 +542,37 @@ def update_privacy_settings(data: PrivacySettingsIn, background_tasks: Backgroun
         for chunk in chunks:
             chunk.embedding = None
         db.commit()
-    elif settings.embedding_model and settings.ai_api_key and settings.ai_provider.strip().lower() in {"openai", "openai_compatible"}:
+    elif settings.embedding_model and (settings.ai_fallback_api_key or settings.ai_api_key):
         background_tasks.add_task(backfill_knowledge_embeddings, user.organization_id)
     result = get_privacy_settings(user, db)
-    result["embedding_backfill_queued"] = bool(data.external_ai_enabled and settings.embedding_model and settings.ai_api_key and settings.ai_provider.strip().lower() in {"openai", "openai_compatible"})
+    result["embedding_backfill_queued"] = bool(data.external_ai_enabled and settings.embedding_model and (settings.ai_fallback_api_key or settings.ai_api_key))
     return result
+
+
+@app.get("/api/settings/providers")
+def get_provider_status(user: User = Depends(roles("admin"))):
+    """Workspace admin-only, credential-free provider and circuit status."""
+    from .ai import provider_status
+    return {
+        "primary": settings.ai_provider,
+        "fallback": settings.ai_fallback_provider,
+        "primary_model": settings.gemini_text_model,
+        "primary_vision_model": settings.gemini_vision_model,
+        "primary_alternate_model": settings.gemini_text_model_alternate,
+        "primary_alternate_vision_model": settings.gemini_vision_model_alternate,
+        "fallback_model": settings.ai_fallback_text_model,
+        "fallback_vision_model": settings.ai_fallback_vision_model,
+        "fallback_alternate_model": settings.ai_fallback_text_model_alternate,
+        "fallback_alternate_vision_model": settings.ai_fallback_vision_model_alternate,
+        "status": provider_status(),
+    }
 
 
 def backfill_knowledge_embeddings(organization_id: int):
     """Fill vectors for sources approved before the workspace opted into embeddings."""
-    from .ai import AIProviderError, provider_from_config
+    from .ai import AIProviderError, embedding_provider_from_config
     try:
-        provider = provider_from_config()
+        provider = embedding_provider_from_config()
         with SessionLocal() as db:
             organization = db.get(Organization, organization_id)
             if not organization or not organization.external_ai_enabled or not settings.embedding_model:
@@ -654,8 +695,8 @@ def approve_knowledge(item_id: int, user: User = Depends(roles("admin")), db: Se
     provider = None
     if organization.external_ai_enabled and settings.embedding_model:
         try:
-            from .ai import provider_from_config
-            provider = provider_from_config()
+            from .ai import embedding_provider_from_config
+            provider = embedding_provider_from_config()
         except Exception as exc:
             logger.info("Source embedding unavailable during confirmation (%s)", type(exc).__name__)
     chunks = chunk_source(source_text)
@@ -772,14 +813,14 @@ def analyse_review_content(db: Session, user: User, content: str, channel: str, 
     organization = db.get(Organization, user.organization_id)
     ai_status = "disabled"
     if organization.external_ai_enabled:
-        from .ai import AIProviderError, provider_from_config
+        from .ai import AIProviderError, embedding_provider_from_config, provider_from_config
         from .retrieval import retrieve_approved
         try:
             provider = provider_from_config()
             query_embedding = None
             if settings.embedding_model:
                 try:
-                    query_embedding = provider.embed(content)
+                    query_embedding = embedding_provider_from_config().embed(content)
                 except AIProviderError as exc:
                     logger.info("Semantic query embedding unavailable; using lexical retrieval (%s)", type(exc).__name__)
             retrieved = retrieve_approved(db, user.organization_id, content, query_embedding)
@@ -809,7 +850,9 @@ def create_review(data: ReviewIn, user: User = Depends(current_user), db: Sessio
 
 
 def serialize_review(r: Review):
-    return {"id": r.id, "title": r.title, "content": r.content, "channel": r.channel, "audience": r.audience, "goal": r.goal, "status": r.status, "ai_status": r.ai_status, "assigned_to": r.assigned_to, "created_at": r.created_at.isoformat(), "findings": [{"id": f.id, "kind": f.kind, "excerpt": f.excerpt, "explanation": f.explanation, "severity": f.severity, "confidence": f.confidence, "citation": f.citation, "suggestion": f.suggestion, "status": f.status} for f in r.findings if f.status != "stale"]}
+    return {"id": r.id, "title": r.title, "content": r.content, "channel": r.channel, "audience": r.audience, "goal": r.goal, "status": r.status, "ai_status": r.ai_status,
+            "ai_message": "AI analysis is temporarily unavailable. Your review was saved; please retry analysis shortly." if r.ai_status == "error" else None,
+            "assigned_to": r.assigned_to, "created_at": r.created_at.isoformat(), "findings": [{"id": f.id, "kind": f.kind, "excerpt": f.excerpt, "explanation": f.explanation, "severity": f.severity, "confidence": f.confidence, "citation": f.citation, "suggestion": f.suggestion, "status": f.status} for f in r.findings if f.status != "stale"]}
 
 
 @app.get("/api/reviews")
@@ -1115,7 +1158,7 @@ async def visual_review(
     ai_findings = []
     organization = db.get(Organization, user.organization_id)
     if organization.external_ai_enabled:
-        if not settings.vision_model and not settings.ai_model:
+        if not settings.gemini_vision_model and not settings.vision_model and not settings.ai_model:
             ai_status = "not_configured"
         elif not retrieved:
             ai_status = "no_sources"

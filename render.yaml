@@ -25,7 +25,7 @@ services:
       - key: S3_BUCKET
         sync: false
       - key: S3_REGION
-        value: auto
+        sync: false
       - key: S3_ACCESS_KEY_ID
         sync: false
       - key: S3_SECRET_ACCESS_KEY
@@ -35,19 +35,47 @@ services:
       - key: S3_SSE_KMS_KEY_ID
         value: ""
       - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_TEXT_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_VISION_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_TEXT_MODEL_ALTERNATE
+        value: gemini-3.7-flash
+      - key: GEMINI_VISION_MODEL_ALTERNATE
+        value: gemini-3.7-flash
+      - key: AI_FALLBACK_PROVIDER
         value: openai_compatible
-      - key: AI_API_BASE_URL
+      - key: AI_FALLBACK_API_BASE_URL
         value: https://api.openai.com/v1
-      - key: AI_API_KEY
+      - key: AI_FALLBACK_API_KEY
         sync: false
-      - key: AI_MODEL
-        sync: false
-      - key: VISION_MODEL
-        sync: false
+      - key: AI_FALLBACK_TEXT_MODEL
+        value: gpt-6-luna
+      - key: AI_FALLBACK_VISION_MODEL
+        value: gpt-6-luna
+      - key: AI_FALLBACK_TEXT_MODEL_ALTERNATE
+        value: gpt-5.6-luna
+      - key: AI_FALLBACK_VISION_MODEL_ALTERNATE
+        value: gpt-5.6-luna
+      - key: EMBEDDING_PROVIDER
+        value: openai_compatible
       - key: EMBEDDING_MODEL
         value: text-embedding-3-small
       - key: AI_TIMEOUT_SECONDS
         value: "45"
+      - key: AI_PROVIDER_MAX_RETRIES
+        value: "2"
+      - key: AI_RETRY_BASE_SECONDS
+        value: "0.5"
+      - key: AI_RETRY_MAX_SECONDS
+        value: "4"
+      - key: AI_CIRCUIT_BREAKER_FAILURES
+        value: "3"
+      - key: AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS
+        value: "60"
       - key: OCR_LANGUAGE
         value: eng
       - key: ACCESS_TOKEN_MINUTES

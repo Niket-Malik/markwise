@@ -46,6 +46,27 @@ def register(client, org, email):
     return response.json()["access_token"]
 
 
+def install_fake_s3(monkeypatch, fake_client, calls):
+    import sys
+    import types
+
+    class FakeConfig:
+        def __init__(self, signature_version, s3):
+            self.signature_version = signature_version
+            self.s3 = s3
+
+    botocore = types.ModuleType("botocore")
+    botocore.__path__ = []
+    config_module = types.ModuleType("botocore.config")
+    config_module.Config = FakeConfig
+    botocore.config = config_module
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", config_module)
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(
+        client=lambda *args, **kwargs: (calls.append(("client", kwargs)) or fake_client)
+    ))
+
+
 def test_admin_confirmation_and_abstaining_claim(client):
     token = register(client, "Acme", "admin@acme.test")
     headers = {"Authorization": f"Bearer {token}"}
@@ -347,7 +368,6 @@ def test_upload_rejects_mismatched_file_signature_before_storage(client, monkeyp
 
 
 def test_s3_storage_adapter_uses_opaque_org_scoped_keys(monkeypatch):
-    import sys
     from types import SimpleNamespace
     from backend.app.main import Settings
     from backend.app.storage import delete_object, put_object
@@ -357,34 +377,77 @@ def test_s3_storage_adapter_uses_opaque_org_scoped_keys(monkeypatch):
         put_object=lambda **kwargs: calls.append(("put", kwargs)),
         delete_object=lambda **kwargs: calls.append(("delete", kwargs)),
     )
-    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: fake_client))
-    config = Settings(storage_backend="s3", s3_bucket="markwise-test", s3_region="us-east-1", s3_access_key_id="test-key", s3_secret_access_key="test-secret")
+    install_fake_s3(monkeypatch, fake_client, calls)
+    config = Settings(storage_backend="s3", s3_endpoint_url="", s3_bucket="markwise-test", s3_region="us-east-1", s3_access_key_id="test-key", s3_secret_access_key="test-secret", s3_server_side_encryption="AES256")
     key = put_object(42, "random-object", "../brand logo.png", b"image-bytes", config)
     assert key == "s3:42/random-object-brand_logo.png"
     delete_object(key, config)
-    assert calls[0][1]["Bucket"] == "markwise-test"
-    assert calls[0][1]["Key"].startswith("42/")
-    assert calls[0][1]["ServerSideEncryption"] == "AES256"
-    assert calls[1][1]["Key"] == calls[0][1]["Key"]
-    kms = Settings(storage_backend="s3", s3_bucket="markwise-test", s3_region="us-east-1", s3_access_key_id="test-key", s3_secret_access_key="test-secret", s3_server_side_encryption="aws:kms", s3_sse_kms_key_id="test-kms")
+    put_args = next(args for action, args in calls if action == "put")
+    delete_args = next(args for action, args in calls if action == "delete")
+    assert put_args["Bucket"] == "markwise-test"
+    assert put_args["Key"].startswith("42/")
+    assert put_args["ServerSideEncryption"] == "AES256"
+    assert delete_args["Key"] == put_args["Key"]
+    kms = Settings(storage_backend="s3", s3_endpoint_url="", s3_bucket="markwise-test", s3_region="us-east-1", s3_access_key_id="test-key", s3_secret_access_key="test-secret", s3_server_side_encryption="aws:kms", s3_sse_kms_key_id="test-kms")
     put_object(42, "kms-object", "guide.pdf", b"pdf", kms)
     assert calls[-1][1]["ServerSideEncryption"] == "aws:kms"
     assert calls[-1][1]["SSEKMSKeyId"] == "test-kms"
 
 
 def test_r2_storage_uses_managed_encryption_without_unsupported_sse_headers(monkeypatch):
-    import sys
     from types import SimpleNamespace
     from backend.app.main import Settings
     from backend.app.storage import put_object
 
     calls = []
-    fake_client = SimpleNamespace(put_object=lambda **kwargs: calls.append(kwargs))
-    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: fake_client))
+    fake_client = SimpleNamespace(put_object=lambda **kwargs: calls.append(("put", kwargs)))
+    install_fake_s3(monkeypatch, fake_client, calls)
     config = Settings(storage_backend="s3", s3_endpoint_url="https://acct.r2.cloudflarestorage.com", s3_bucket="markwise", s3_region="auto", s3_access_key_id="r2-key", s3_secret_access_key="r2-secret")
     put_object(9, "object", "guide.pdf", b"pdf", config)
-    assert calls[0]["Bucket"] == "markwise"
-    assert "ServerSideEncryption" not in calls[0]
+    put_args = next(args for action, args in calls if action == "put")
+    assert put_args["Bucket"] == "markwise"
+    assert "ServerSideEncryption" not in put_args
+
+
+def test_supabase_s3_uses_sigv4_path_style_and_private_server_side_roundtrip(monkeypatch):
+    from types import SimpleNamespace
+    from backend.app.main import Settings
+    from backend.app.storage import delete_object, get_object, put_object
+
+    calls = []
+    payload = b"private Supabase storage probe"
+
+    class Body:
+        def read(self):
+            return payload
+        def close(self):
+            calls.append(("body_closed", {}))
+
+    fake_client = SimpleNamespace(
+        put_object=lambda **kwargs: calls.append(("put", kwargs)),
+        get_object=lambda **kwargs: (calls.append(("get", kwargs)) or {"Body": Body()}),
+        delete_object=lambda **kwargs: calls.append(("delete", kwargs)),
+    )
+    install_fake_s3(monkeypatch, fake_client, calls)
+    config = Settings(
+        storage_backend="s3",
+        s3_endpoint_url="https://project-ref.storage.supabase.co/storage/v1/s3",
+        s3_bucket="markwise-assets", s3_region="ap-southeast-1",
+        s3_access_key_id="test-key", s3_secret_access_key="test-secret",
+        s3_server_side_encryption="AES256",
+    )
+    key = put_object(9, "probe", "guide.pdf", payload, config)
+    assert get_object(key, config) == payload
+    delete_object(key, config)
+    client_config = next(args[1]["config"] for args in calls if args[0] == "client")
+    assert client_config.signature_version == "s3v4"
+    assert client_config.s3["addressing_style"] == "path"
+    put_args = next(args[1] for args in calls if args[0] == "put")
+    assert put_args["Bucket"] == "markwise-assets"
+    assert put_args["Key"] == "9/probe-guide.pdf"
+    assert "ServerSideEncryption" not in put_args
+    assert next(args[1] for args in calls if args[0] == "get")["Key"] == put_args["Key"]
+    assert any(action == "body_closed" for action, _ in calls)
 
 
 def test_embedding_adapter_checks_batch_size_and_vector_dimensions(monkeypatch):
@@ -468,6 +531,29 @@ def test_visual_review_uses_approved_sources_and_validated_vision_output(client,
     assert result.json()["ai_status"] == "complete"
     finding = next(f for f in result.json()["findings"] if f["kind"] == "ai_contrast")
     assert "Infographic contrast" in finding["citation"]
+
+
+def test_provider_status_is_admin_only_and_never_returns_credentials(client, monkeypatch):
+    import backend.app.main as main
+    admin_token = register(client, "Provider Status Co", "provider-admin@example.test")
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    monkeypatch.setattr(main.settings, "ai_provider", "gemini")
+    monkeypatch.setattr(main.settings, "gemini_api_key", "DO_NOT_RETURN_GEMINI_KEY")
+    monkeypatch.setattr(main.settings, "ai_fallback_api_key", "DO_NOT_RETURN_OPENAI_KEY")
+    response = client.get("/api/settings/providers", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["primary"] == "gemini"
+    assert "DO_NOT_RETURN_GEMINI_KEY" not in response.text
+    assert "DO_NOT_RETURN_OPENAI_KEY" not in response.text
+    member = client.post("/api/team", headers=admin_headers, json={
+        "name": "Reviewer", "email": "reviewer@example.test", "password": "long-test-password-123",
+        "role": "reviewer",
+    })
+    assert member.status_code == 200
+    member_login = client.post("/api/auth/login", json={"email": "reviewer@example.test", "password": "long-test-password-123"})
+    assert member_login.status_code == 200
+    member_headers = {"Authorization": f"Bearer {member_login.json()['access_token']}"}
+    assert client.get("/api/settings/providers", headers=member_headers).status_code == 403
 
 
 def test_z_auth_rate_limit(client):
