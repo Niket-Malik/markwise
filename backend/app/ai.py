@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -27,12 +28,19 @@ class AIProviderError(RuntimeError):
 
 class ProviderRequestError(AIProviderError):
     def __init__(self, provider: str, message: str, retryable: bool, retry_after: float | None = None,
-                 scope: str = "model"):
+                 scope: str = "model", *, status_code: int | None = None,
+                 error_code: str | None = None, operation: str | None = None,
+                 model: str | None = None, safe_message: str | None = None):
         super().__init__(message)
         self.provider = provider
         self.retryable = retryable
         self.retry_after = retry_after
         self.scope = scope
+        self.status_code = status_code
+        self.error_code = error_code
+        self.operation = operation
+        self.model = model
+        self.safe_message = safe_message or message
 
 
 class CandidateFinding(BaseModel):
@@ -66,27 +74,56 @@ def _parse_retry_after(value: str | None) -> float | None:
             return None
 
 
-def _http_error(provider: str, response: httpx.Response) -> ProviderRequestError:
+def _http_error(provider: str, response: httpx.Response, *, model: str | None = None,
+                operation: str | None = None) -> ProviderRequestError:
     status = response.status_code
-    # Only inspect provider error text to distinguish explicit quota exhaustion (some
-    # APIs report it as 403); never include that text in logs or user-visible errors.
+    # Read only a machine-readable error code. Do not log arbitrary upstream messages,
+    # which can echo submitted content or sensitive request values.
     try:
-        body = response.text[:4000].lower()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            payload = {}
+        error = payload.get("error", {})
+        if not isinstance(error, dict):
+            error = {"message": error}
+        body = json.dumps(payload, ensure_ascii=True).lower()
+        raw_code = error.get("status") or error.get("type") or error.get("code")
+        error_code = re.sub(r"[^a-zA-Z0-9_.-]", "", str(raw_code))[:80] if raw_code is not None else None
     except Exception:
         body = ""
+        error_code = None
     provider_quota = status == 429 or (status == 403 and any(marker in body for marker in ("quota", "resource_exhausted", "insufficient_quota")))
     retryable = status in {408, 425} or 500 <= status <= 599
-    label = "quota/rate limit exhausted" if provider_quota else "temporarily unavailable" if retryable else "rejected the request"
-    return ProviderRequestError(provider, f"{provider} {label} (HTTP {status})", retryable,
-                                _parse_retry_after(response.headers.get("Retry-After")),
-                                scope="provider_quota" if provider_quota else "model")
+    if provider_quota:
+        label, category = "quota/rate limit exhausted", "quota_or_rate_limit"
+    elif status in {401, 403}:
+        label, category = "rejected credentials or permissions", "authentication_or_permission_rejected"
+    elif status == 404:
+        label, category = "model or endpoint not found", "model_or_endpoint_not_found"
+    elif status == 400:
+        label, category = "rejected the request", "invalid_request"
+    elif retryable:
+        label, category = "temporarily unavailable", "provider_temporarily_unavailable"
+    else:
+        label, category = "rejected the request", "provider_rejected_request"
+    return ProviderRequestError(
+        provider, f"{provider} {label} (HTTP {status})", retryable,
+        _parse_retry_after(response.headers.get("Retry-After")),
+        scope="provider_quota" if provider_quota else "model", status_code=status,
+        error_code=error_code, operation=operation, model=model, safe_message=category,
+    )
 
 
-def _request(provider: str, url: str, *, headers: dict, payload: dict, timeout: float) -> dict:
+def _request(provider: str, url: str, *, headers: dict, payload: dict, timeout: float,
+             model: str | None = None, operation: str | None = None) -> dict:
     try:
         response = httpx.post(url, headers=headers, json=payload, timeout=timeout)
         if response.is_error is True or (isinstance(response.status_code, int) and response.status_code >= 400):
-            raise _http_error(provider, response)
+            error = _http_error(provider, response, model=model, operation=operation)
+            logger.error("ai_provider_http_error provider=%s model=%s operation=%s status=%s error_code=%s error_message=%s",
+                         provider, model or "unknown", operation or "unknown", error.status_code,
+                         error.error_code or "unknown", error.safe_message)
+            raise error
         result = response.json()
         if not isinstance(result, dict):
             raise ProviderRequestError(provider, f"{provider} returned an invalid response", False)
@@ -94,10 +131,16 @@ def _request(provider: str, url: str, *, headers: dict, payload: dict, timeout: 
     except ProviderRequestError:
         raise
     except httpx.TimeoutException as exc:
+        logger.error("ai_provider_transport_error provider=%s model=%s operation=%s status=none error_message=timeout",
+                     provider, model or "unknown", operation or "unknown")
         raise ProviderRequestError(provider, f"{provider} request timed out", True) from exc
     except httpx.ConnectError as exc:
+        logger.error("ai_provider_transport_error provider=%s model=%s operation=%s status=none error_message=connection_failed",
+                     provider, model or "unknown", operation or "unknown")
         raise ProviderRequestError(provider, f"{provider} could not be reached", True) from exc
     except httpx.TransportError as exc:
+        logger.error("ai_provider_transport_error provider=%s model=%s operation=%s status=none error_message=transport_failed",
+                     provider, model or "unknown", operation or "unknown")
         raise ProviderRequestError(provider, f"{provider} connection failed", True) from exc
     except (ValueError, httpx.HTTPError) as exc:
         raise ProviderRequestError(provider, f"{provider} returned an invalid response", False) from exc
@@ -174,12 +217,13 @@ class OpenAICompatibleProvider:
         vision = supported
         return model in (vision if method == "analyse_image" else supported)
 
-    def _post(self, endpoint: str, payload: dict) -> dict:
+    def _post(self, endpoint: str, payload: dict, *, model: str | None = None, operation: str | None = None) -> dict:
         if not self.api_key:
             raise ProviderRequestError(self.name, "OpenAI API key is not configured", False)
         return _request(self.name, f"{self.base_url}/{endpoint.lstrip('/')}",
                         headers={"Authorization": f"Bearer {self.api_key}"}, payload=payload,
-                        timeout=self.config.ai_timeout_seconds)
+                        timeout=self.config.ai_timeout_seconds, model=model or payload.get("model"),
+                        operation=operation or endpoint)
 
     def embed(self, text: str) -> list[float]:
         return self.embed_many([text])[0]
@@ -189,7 +233,8 @@ class OpenAICompatibleProvider:
             raise AIProviderError("EMBEDDING_MODEL is not configured")
         if not texts:
             return []
-        result = self._post("embeddings", {"model": self.embedding_model, "input": [text[:8000] for text in texts]})
+        result = self._post("embeddings", {"model": self.embedding_model, "input": [text[:8000] for text in texts]},
+                            model=self.embedding_model, operation="embed_many")
         try:
             rows = sorted(result["data"], key=lambda row: int(row["index"]))
             vectors = [[float(value) for value in row["embedding"]] for row in rows]
@@ -207,7 +252,8 @@ class OpenAICompatibleProvider:
         result = self._post("chat/completions", {"model": model,
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "markwise_analysis", "strict": True, "schema": GeminiProvider._response_schema(openai=True)}}, "messages": [
-                {"role": "system", "content": system}, {"role": "user", "content": user}]})
+                {"role": "system", "content": system}, {"role": "user", "content": user}]},
+                model=model, operation="analyse")
         return _parse_openai_result(result)
 
     def analyse_image(self, image: bytes, mime_type: str, context: dict, sources: list[Knowledge],
@@ -225,7 +271,8 @@ class OpenAICompatibleProvider:
         result = self._post("chat/completions", {"model": model,
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "markwise_analysis", "strict": True, "schema": GeminiProvider._response_schema(openai=True)}}, "messages": [
-                {"role": "system", "content": system}, {"role": "user", "content": content}]})
+                {"role": "system", "content": system}, {"role": "user", "content": content}]},
+                model=model, operation="analyse_image")
         return _parse_openai_result(result)
 
 
@@ -294,10 +341,21 @@ class GeminiProvider:
         result = _request(self.name,
             "https://generativelanguage.googleapis.com/v1beta/interactions",
             headers={"x-goog-api-key": self.config.gemini_api_key}, payload=payload,
-            timeout=self.config.ai_timeout_seconds)
+            timeout=self.config.ai_timeout_seconds,
+            model=model, operation="analyse_image" if image_parts else "analyse")
         try:
             if result.get("status") not in (None, "completed"):
-                raise ProviderRequestError(self.name, "Gemini did not complete the analysis", False)
+                response_error = result.get("error") if isinstance(result.get("error"), dict) else {}
+                raw_code = response_error.get("status") or response_error.get("type") or response_error.get("code")
+                error_code = re.sub(r"[^a-zA-Z0-9_.-]", "", str(raw_code))[:80] if raw_code is not None else None
+                interaction_status = str(result.get("status", "unknown"))[:40]
+                logger.error("ai_provider_incomplete_response provider=gemini model=%s operation=%s status=%s error_code=%s error_message=interaction_not_completed",
+                             model, "analyse_image" if image_parts else "analyse", interaction_status,
+                             error_code or "unknown")
+                raise ProviderRequestError(self.name, "Gemini did not complete the analysis", False,
+                                           status_code=200, error_code=error_code,
+                                           operation="analyse_image" if image_parts else "analyse",
+                                           model=model, safe_message="interaction_not_completed")
             raw = result.get("output_text")
             if not raw:
                 raw = "".join(
@@ -459,7 +517,9 @@ class FailoverProvider:
                 return result
             except ProviderRequestError as exc:
                 if not exc.retryable and exc.scope != "provider_quota":
-                    logger.error("ai_provider_permanent_failure provider=gemini operation=%s error_type=%s", method, type(exc).__name__)
+                    logger.error("ai_provider_permanent_failure provider=gemini model=%s operation=%s status=%s error_code=%s error_message=%s",
+                                 exc.model or "unknown", method, exc.status_code or "none",
+                                 exc.error_code or "unknown", exc.safe_message)
                     raise AIProviderError(str(exc)) from exc
                 logger.warning("ai_provider_failover from=gemini to=openai operation=%s", method)
         else:
@@ -472,7 +532,9 @@ class FailoverProvider:
                 logger.info("ai_provider_success provider=openai operation=%s fallback=true", method)
                 return result
             except ProviderRequestError as exc:
-                logger.error("ai_provider_failure provider=openai operation=%s retryable=%s", method, exc.retryable)
+                logger.error("ai_provider_failure provider=openai model=%s operation=%s status=%s error_code=%s error_message=%s retryable=%s",
+                             exc.model or "unknown", method, exc.status_code or "none",
+                             exc.error_code or "unknown", exc.safe_message, exc.retryable)
         else:
             logger.error("ai_provider_unavailable provider=openai operation=%s", method)
         raise AIProviderError("AI analysis is temporarily unavailable. Your review was saved; please retry the analysis shortly.")

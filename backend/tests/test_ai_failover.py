@@ -21,6 +21,7 @@ def test_http_errors_classify_retryable_and_permanent_without_leaking_body():
         response.status_code = status
         response.headers = {"Retry-After": "2"}
         response.text = '{"error":"private provider body"}'
+        response.json.return_value = {"error": {"message": "private provider body"}}
         err = ai._http_error("gemini", response)
         assert err.retryable is (status != 429)
         if status == 429:
@@ -32,15 +33,50 @@ def test_http_errors_classify_retryable_and_permanent_without_leaking_body():
     quota.status_code = 403
     quota.headers = {}
     quota.text = '{"error":"quota exceeded"}'
+    quota.json.return_value = {"error": {"message": "quota exceeded"}}
     assert ai._http_error("gemini", quota).scope == "provider_quota"
     quota.text = '{"status":"RESOURCE_EXHAUSTED"}'
+    quota.json.return_value = {"status": "RESOURCE_EXHAUSTED"}
     assert ai._http_error("gemini", quota).scope == "provider_quota"
 
     invalid_key = Mock(spec=httpx.Response)
     invalid_key.status_code = 401
     invalid_key.headers = {}
     invalid_key.text = '{"error":"invalid API key"}'
+    invalid_key.json.return_value = {"error": {"message": "invalid API key"}}
     assert ai._http_error("gemini", invalid_key).retryable is False
+
+
+@pytest.mark.parametrize(("status", "code", "category"), [
+    (400, "INVALID_ARGUMENT", "invalid_request"),
+    (401, "UNAUTHENTICATED", "authentication_or_permission_rejected"),
+    (403, "PERMISSION_DENIED", "authentication_or_permission_rejected"),
+    (404, "NOT_FOUND", "model_or_endpoint_not_found"),
+    (429, "RESOURCE_EXHAUSTED", "quota_or_rate_limit"),
+    (503, "UNAVAILABLE", "provider_temporarily_unavailable"),
+])
+def test_provider_error_logs_diagnostic_fields_without_upstream_message_or_secrets(monkeypatch, caplog, status, code, category):
+    response = Mock(spec=httpx.Response)
+    response.status_code = status
+    response.headers = {}
+    response.is_error = True
+    response.json.return_value = {"error": {
+        "code": status, "status": code,
+        "message": "private draft text and API key sk-secret-never-log",
+    }}
+    monkeypatch.setattr(ai.httpx, "post", Mock(return_value=response))
+    with pytest.raises(ai.ProviderRequestError):
+        ai._request("gemini", "https://example.invalid", headers={}, payload={}, timeout=1,
+                    model="gemini-3.8-flash", operation="analyse")
+    output = caplog.text
+    assert "provider=gemini" in output
+    assert "model=gemini-3.8-flash" in output
+    assert "operation=analyse" in output
+    assert f"status={status}" in output
+    assert f"error_code={code}" in output
+    assert f"error_message={category}" in output
+    assert "private draft text" not in output
+    assert "sk-secret-never-log" not in output
 
 
 def test_gemini_text_and_image_requests_preserve_schema_context(monkeypatch):
@@ -72,11 +108,32 @@ def test_gemini_text_and_image_requests_preserve_schema_context(monkeypatch):
     assert all(part["type"] == "image" for part in parts[1:])
 
 
+def test_gemini_incomplete_interaction_logs_safe_failure_metadata(monkeypatch, caplog):
+    def fake_post(_url, **_kwargs):
+        response = Mock()
+        response.status_code = 200
+        response.is_error = False
+        response.json.return_value = {"status": "failed", "error": {
+            "code": "INTERNAL_ERROR", "message": "private submitted text"}}
+        return response
+
+    monkeypatch.setattr(ai.httpx, "post", fake_post)
+    provider = ai.GeminiProvider(Settings(gemini_api_key="not-logged", gemini_text_model="gemini-3.8-flash"))
+    with pytest.raises(ai.ProviderRequestError):
+        provider.analyse("private submitted text", {}, [])
+    assert "model=gemini-3.8-flash" in caplog.text
+    assert "operation=analyse" in caplog.text
+    assert "status=failed" in caplog.text
+    assert "error_code=INTERNAL_ERROR" in caplog.text
+    assert "private submitted text" not in caplog.text
+    assert "not-logged" not in caplog.text
+
+
 def test_openai_alternate_requests_keep_strict_json_schema_for_text_and_vision(monkeypatch):
     calls = []
     config = Settings(ai_api_key="test-key", ai_model="gpt-6-luna", vision_model="gpt-6-luna")
     provider = ai.OpenAICompatibleProvider(config)
-    def fake_post(endpoint, payload):
+    def fake_post(endpoint, payload, **_kwargs):
         calls.append((endpoint, payload))
         return {"choices": [{"message": {"content": '{"findings": []}'}}]}
     monkeypatch.setattr(provider, "_post", fake_post)
