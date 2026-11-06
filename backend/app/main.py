@@ -25,7 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete as sql_delete, func, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete as sql_delete, func, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
 
@@ -177,6 +177,8 @@ class Review(Base):
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
     creator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    source_asset_id: Mapped[int | None] = mapped_column(ForeignKey("stored_assets.id", ondelete="SET NULL"), nullable=True, index=True)
+    reference_asset_id: Mapped[int | None] = mapped_column(ForeignKey("stored_assets.id", ondelete="SET NULL"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(240))
     content: Mapped[str] = mapped_column(Text)
     channel: Mapped[str] = mapped_column(String(60), default="Website")
@@ -447,6 +449,43 @@ class RetentionSettingsIn(BaseModel):
 
 def audit(db: Session, user: User, action: str, entity: str, entity_id: int):
     db.add(AuditEvent(organization_id=user.organization_id, user_id=user.id, action=action, entity_type=entity, entity_id=entity_id))
+
+
+def delete_stored_asset(db: Session, asset: StoredAsset, user: User | None = None) -> None:
+    """Detach reviews and delete object/row as one compensated operation."""
+    from .storage import StoredObjectNotFound, delete_object, get_object, restore_object
+
+    storage_key = asset.storage_key
+    try:
+        payload = get_object(storage_key, settings)
+    except StoredObjectNotFound:
+        # S3 DeleteObject is idempotent; a missing object must not strand its
+        # database metadata or a review reference forever.
+        payload = None
+    delete_attempted = False
+    try:
+        # Clear both links explicitly, in this transaction, before deleting the
+        # asset row. The FK also uses SET NULL as a final database-level guard.
+        db.execute(update(Review).where(Review.source_asset_id == asset.id).values(source_asset_id=None))
+        db.execute(update(Review).where(Review.reference_asset_id == asset.id).values(reference_asset_id=None))
+        db.delete(asset)
+        db.flush()
+        if payload is not None:
+            delete_attempted = True
+            delete_object(storage_key, settings)
+        if user is not None:
+            audit(db, user, "asset.deleted", "asset", asset.id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        if delete_attempted and payload is not None:
+            try:
+                # Covers storage calls that deleted the object and then raised,
+                # and database commit failures after storage deletion.
+                restore_object(storage_key, payload, settings)
+            except Exception as restore_error:
+                logger.critical("Asset deletion compensation failed for asset %s (%s)", asset.id, type(restore_error).__name__)
+        raise
 
 
 def remove_review_records(db: Session, review: Review):
@@ -741,6 +780,69 @@ def analyse(content: str, knowledge: list[Knowledge]) -> list[dict]:
     return findings
 
 
+FACTUAL_CLAIM_RE = re.compile(
+    r"\b(?:\d+(?:[,.]\d+)*(?:\s?(?:%|x|times|millions?|billions?|thousands?|hundreds?|dozens?|users?|customers?|clients?|companies|days?|weeks?|months?|years?))?"
+    r"|doubles?|triples?|quadruples?|increas(?:e|es|ed|ing)|reduc(?:e|es|ed|ing)|"
+    r"improv(?:e|es|ed|ing)|cut(?:s|ting)?|sav(?:e|es|ed|ing)|eliminat(?:e|es|ed|ing)|"
+    r"boost(?:s|ed|ing)?|generat(?:e|es|ed|ing)|achiev(?:e|es|ed|ing)|transform(?:s|ed|ing)?|"
+    r"ensur(?:e|es|ed|ing)|result(?:s|ed|ing) in|leads? to|certified|compliant|compli(?:es|ed) with|"
+    r"encrypts?|encrypted|protects?|protected|trusted by|used by|"
+    r"(?:the\s+)?(?:first|only|largest|leading|best|fastest|number one)|"
+    r"most\s+(?:trusted|popular|effective|accurate|secure|reliable|successful))\b",
+    re.IGNORECASE,
+)
+CLAIM_STOP_WORDS = {"about", "after", "also", "been", "before", "being", "from", "have", "into", "more", "only", "should", "that", "their", "them", "then", "there", "these", "this", "those", "with", "would", "your", "our", "the", "and", "for", "its", "are", "was", "were", "will", "can"}
+
+
+def _normalized_claim_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+(?:%|x)?", value.casefold()))
+
+
+def _claim_sentences(content: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", content) if part.strip()]
+
+
+def analyse_unsupported_factual_claims(content: str, knowledge: list[Knowledge], existing: list[dict]) -> list[dict]:
+    """Conservatively abstain on assertive, factual-looking sentences absent exact approved support."""
+    active_facts = [item for item in knowledge if item.status == "active" and item.kind == "fact"]
+    existing_cannot_verify = {item["excerpt"] for item in existing if item["kind"] == "cannot_verify"}
+    findings = []
+    for sentence in _claim_sentences(content):
+        if not FACTUAL_CLAIM_RE.search(sentence) or sentence in existing_cannot_verify:
+            continue
+        # Percentage claims already have a more specific check in analyse().
+        if re.search(r"\b\d+(?:\.\d+)?\s*%", sentence):
+            continue
+        normalized = _normalized_claim_text(sentence)
+        source_texts = [
+            (fact, _normalized_claim_text(" ".join((fact.title, fact.body, fact.passage))))
+            for fact in active_facts
+        ]
+        if any(normalized and normalized in text for _fact, text in source_texts):
+            continue
+
+        claim_terms = {word for word in re.findall(r"[a-z0-9]{3,}", sentence.casefold()) if word not in CLAIM_STOP_WORDS}
+        related = []
+        for fact, text in source_texts:
+            overlap = len(claim_terms & set(re.findall(r"[a-z0-9]{3,}", text)))
+            if overlap >= 2:
+                related.append((overlap, fact.id, fact))
+        related.sort(key=lambda item: (-item[0], item[1]))
+        if related:
+            fact = related[0][2]
+            passage = fact.passage.strip() or fact.body.strip()
+            citation = f"FACT #{fact.id} — {fact.source}, {fact.title}, v{fact.version}: ‘{passage[:300]}’ (related guidance only; it does not substantiate this claim)"
+        else:
+            citation = "No matching active approved fact in this workspace."
+        findings.append({
+            "kind": "cannot_verify", "excerpt": sentence,
+            "explanation": "This factual claim could not be matched to exact supporting evidence in approved workspace facts. Marked CANNOT VERIFY instead of guessing.",
+            "severity": "high", "confidence": 0.8, "citation": citation,
+            "suggestion": "Confirm this statement with an approved source before publication.",
+        })
+    return findings
+
+
 def validate_ai_findings(content: str, candidates, retrieved: list[Knowledge], existing: list[dict], image_dimensions: tuple[int, int] | None = None) -> list[dict]:
     """Accept only exact draft spans and citations from the retrieved, active workspace set."""
     allowed = {source.id: source for source in retrieved if source.status == "active"}
@@ -833,7 +935,115 @@ def analyse_review_content(db: Session, user: User, content: str, channel: str, 
         except Exception as exc:
             ai_status = "error"
             logger.exception("Unexpected AI analysis failure (%s)", type(exc).__name__)
+    if ai_status != "complete":
+        results.extend(analyse_unsupported_factual_claims(content, knowledge, results))
     return results, ai_status
+
+
+def review_workflow_status(ai_status: str, findings: list[dict]) -> str:
+    if ai_status in {"disabled", "not_configured", "no_sources", "error", "retrying"}:
+        return "analysis_incomplete"
+    return "needs_review" if any(f["severity"] in {"high", "critical"} for f in findings) else "checked"
+
+
+def analysis_summary(ai_status: str, finding_count: int) -> dict:
+    if ai_status == "complete":
+        return {"analysis_state": "completed", "analysis_mode": "ai", "analysis_note": None,
+                "clean_review": finding_count == 0, "ai_message": None}
+    if ai_status == "retrying":
+        return {"analysis_state": "retrying", "analysis_mode": "knowledge_base_fallback",
+                "analysis_note": "AI Analysis Pending/Retrying. Existing Knowledge Base fallback findings remain available.",
+                "clean_review": False, "ai_message": None}
+    if ai_status == "no_sources":
+        return {"analysis_state": "incomplete_sources", "analysis_mode": "ai_incomplete",
+                "analysis_note": "AI ran, but no approved workspace sources were available to ground a complete review. Treat unsupported claims as CANNOT VERIFY; this is not a clean review.",
+                "clean_review": False, "ai_message": None}
+    reason = {
+        "disabled": "External AI was not enabled for this workspace.",
+        "not_configured": "AI Analysis Unavailable: provider credentials or model settings are incomplete.",
+        "error": "AI Analysis Unavailable: the configured providers did not complete analysis.",
+    }.get(ai_status, "AI analysis did not complete.")
+    insufficient = " CANNOT VERIFY: no deterministic conflict was found, but this does not establish that the draft complies." if finding_count == 0 else ""
+    note = f"Knowledge Base Fallback Review. {reason} Deterministic checks against approved workspace guidance ran; this is not a complete AI-powered review and an empty result does not establish compliance.{insufficient}"
+    return {"analysis_state": "failed" if ai_status in {"error", "not_configured"} else "fallback",
+            "analysis_mode": "knowledge_base_fallback", "analysis_note": note, "clean_review": False,
+            "ai_message": reason if ai_status in {"error", "not_configured"} else None}
+
+
+def replace_active_findings(review: Review, finding_data: list[dict], db: Session) -> None:
+    """Keep identical fallback findings stable; stale superseded results for audit history."""
+    active_by_key: dict[tuple[str, str], Finding] = {}
+    for old in review.findings:
+        if old.status == "stale":
+            continue
+        key = (old.kind, old.excerpt)
+        if key in active_by_key:
+            old.status = "stale"
+        else:
+            active_by_key[key] = old
+    seen: set[tuple[str, str]] = set()
+    fields = ("kind", "excerpt", "explanation", "severity", "confidence", "citation", "suggestion")
+    for values in finding_data:
+        key = (values["kind"], values["excerpt"])
+        if key in seen:
+            continue
+        seen.add(key)
+        old = active_by_key.pop(key, None)
+        if old is not None and all(getattr(old, field) == values.get(field, "") for field in fields):
+            continue
+        if old is not None:
+            old.status = "stale"
+        db.add(Finding(review_id=review.id, **values))
+    for obsolete in active_by_key.values():
+        obsolete.status = "stale"
+
+
+def reanalyse_visual_review(db: Session, user: User, review: Review) -> tuple[list[dict], str]:
+    source_asset = db.get(StoredAsset, review.source_asset_id) if review.source_asset_id else None
+    if not source_asset or source_asset.organization_id != user.organization_id:
+        raise HTTPException(409, "The original image is no longer available for AI retry")
+    from .storage import get_object
+    image_data = get_object(source_asset.storage_key)
+    suffix = Path(source_asset.original_name).suffix.lower()
+    mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
+    if not mime:
+        raise HTTPException(409, "The original image type is not supported for AI retry")
+    reference_data = None
+    reference_mime = "image/png"
+    if review.reference_asset_id:
+        reference_asset = db.get(StoredAsset, review.reference_asset_id)
+        if not reference_asset or reference_asset.organization_id != user.organization_id:
+            raise HTTPException(409, "The reference logo is no longer available for AI retry")
+        reference_data = get_object(reference_asset.storage_key)
+        reference_mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(Path(reference_asset.original_name).suffix.lower(), "image/png")
+
+    knowledge = db.scalars(select(Knowledge).where(Knowledge.organization_id == user.organization_id, Knowledge.status == "active")).all()
+    from .visual_analysis import analyse_visual
+    deterministic, _, dimensions = analyse_visual(image_data, review.audience, review.goal, knowledge, reference_data)
+    def fallback_findings():
+        text_findings = analyse(review.content, knowledge)
+        combined = deterministic + text_findings
+        return combined + analyse_unsupported_factual_claims(review.content, knowledge, combined)
+
+    organization = db.get(Organization, user.organization_id)
+    if not organization.external_ai_enabled:
+        return fallback_findings(), "disabled"
+    from .retrieval import retrieve_approved
+    query = f"{review.audience} logo palette colour contrast accessibility alt text {review.content}"
+    retrieved = retrieve_approved(db, user.organization_id, query)
+    if not retrieved:
+        return fallback_findings(), "no_sources"
+    try:
+        from .ai import AIProviderError, provider_from_config
+        provider = provider_from_config()
+        candidates = provider.analyse_image(image_data, mime, {"role": review.audience, "alt_text": review.goal}, retrieved, reference_data, reference_mime)
+        return deterministic + validate_ai_findings(review.content, candidates.findings, retrieved, deterministic, dimensions), "complete"
+    except AIProviderError as exc:
+        logger.warning("Manual vision retry did not complete (%s)", type(exc).__name__)
+        return fallback_findings(), "not_configured" if "not configured" in str(exc).lower() else "error"
+    except Exception as exc:
+        logger.exception("Manual vision retry failed (%s)", type(exc).__name__)
+        return fallback_findings(), "error"
 
 
 @app.post("/api/reviews")
@@ -844,14 +1054,15 @@ def create_review(data: ReviewIn, user: User = Depends(current_user), db: Sessio
     db.add(ReviewVersion(organization_id=user.organization_id, review_id=review.id, user_id=user.id, content=review.content))
     for finding in results:
         db.add(Finding(review_id=review.id, **finding))
-    review.status = "needs_review" if any(f["severity"] in {"high", "critical"} for f in results) else "checked"
+    review.status = review_workflow_status(ai_status, results)
     audit(db, user, "review.analysed", "review", review.id); db.commit(); db.refresh(review)
     return serialize_review(review)
 
 
 def serialize_review(r: Review):
+    active_findings = [f for f in r.findings if f.status != "stale"]
     return {"id": r.id, "title": r.title, "content": r.content, "channel": r.channel, "audience": r.audience, "goal": r.goal, "status": r.status, "ai_status": r.ai_status,
-            "ai_message": "AI analysis is temporarily unavailable. Your review was saved; please retry analysis shortly." if r.ai_status == "error" else None,
+            **analysis_summary(r.ai_status, len(active_findings)),
             "assigned_to": r.assigned_to, "created_at": r.created_at.isoformat(), "findings": [{"id": f.id, "kind": f.kind, "excerpt": f.excerpt, "explanation": f.explanation, "severity": f.severity, "confidence": f.confidence, "citation": f.citation, "suggestion": f.suggestion, "status": f.status} for f in r.findings if f.status != "stale"]}
 
 
@@ -859,6 +1070,48 @@ def serialize_review(r: Review):
 def list_reviews(user: User = Depends(current_user), db: Session = Depends(db_session)):
     rows = db.scalars(select(Review).where(Review.organization_id == user.organization_id).order_by(Review.created_at.desc())).all()
     return [serialize_review(r) for r in rows]
+
+
+@app.post("/api/reviews/{review_id}/retry-ai")
+def retry_review_ai(review_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    review = db.scalar(select(Review).where(Review.id == review_id, Review.organization_id == user.organization_id).with_for_update())
+    if not review:
+        raise HTTPException(404, "Review not found")
+    if review.creator_id != user.id and user.role not in {"admin", "manager"} and not (user.role == "reviewer" and review.assigned_to == user.id):
+        raise HTTPException(403, "Only the review creator, a workspace manager, or its assigned reviewer can retry analysis")
+    if review.status in {"submitted", "approved", "rejected"}:
+        raise HTTPException(409, "A submitted or decided review cannot be re-analysed")
+    if review.ai_status == "retrying":
+        raise HTTPException(409, "AI analysis is already in progress")
+    if review.ai_status not in {"error", "not_configured", "disabled", "no_sources"}:
+        raise HTTPException(409, "Only a review with unavailable or failed AI analysis can be retried")
+    organization = db.get(Organization, user.organization_id)
+    if not organization.external_ai_enabled:
+        raise HTTPException(409, "Enable external AI in workspace privacy settings before retrying")
+
+    review.ai_status = "retrying"
+    review.status = "analysis_incomplete"
+    db.commit()
+    try:
+        if review.channel == "Image":
+            result_findings, result_status = reanalyse_visual_review(db, user, review)
+        else:
+            result_findings, result_status = analyse_review_content(db, user, review.content, review.channel, review.audience, review.goal)
+    except Exception as exc:
+        logger.exception("Manual AI retry could not complete (%s)", type(exc).__name__)
+        result_findings = [{"kind": finding.kind, "excerpt": finding.excerpt, "explanation": finding.explanation,
+                            "severity": finding.severity, "confidence": finding.confidence, "citation": finding.citation,
+                            "suggestion": finding.suggestion} for finding in review.findings if finding.status != "stale"]
+        result_status = "error"
+
+    review.ai_status = result_status
+    replace_active_findings(review, result_findings, db)
+    review.status = review_workflow_status(result_status, result_findings)
+    audit(db, user, "review.ai_retry_completed" if result_status == "complete" else "review.ai_retry_failed", "review", review.id)
+    db.commit()
+    db.refresh(review)
+    db.expire(review, ["findings"])
+    return serialize_review(review)
 
 
 @app.post("/api/reviews/{review_id}/submit")
@@ -963,7 +1216,7 @@ def update_review(review_id: int, data: ReviewUpdateIn, user: User = Depends(cur
         )
         for finding_data in finding_data_list:
             db.add(Finding(review_id=review.id, **finding_data))
-        review.status = "needs_review" if any(f["severity"] in {"high", "critical"} for f in finding_data_list) else "checked"
+        review.status = review_workflow_status(review.ai_status, finding_data_list)
     audit(db, user, "review.edited", "review", review.id)
     db.commit()
     db.refresh(review)
@@ -1041,7 +1294,7 @@ def finding_decision(finding_id: int, data: dict, user: User = Depends(current_u
         new_findings, review.ai_status = analyse_review_content(db, user, review.content, review.channel, review.audience, review.goal)
         for finding_data in new_findings:
             db.add(Finding(review_id=review.id, **finding_data))
-        review.status = "needs_review" if any(item["severity"] in {"high", "critical"} for item in new_findings) else "checked"
+        review.status = review_workflow_status(review.ai_status, new_findings)
     db.add(FindingDecision(organization_id=user.organization_id, finding_id=finding.id, user_id=user.id, decision=decision, reason=reason.strip()))
     audit(db, user, f"finding.{decision}", "finding", finding.id); db.commit()
     return {"id": finding.id, "status": decision, "suggestion": finding.suggestion, "reason": reason.strip(), "content_updated": decision == "accepted"}
@@ -1173,6 +1426,11 @@ async def visual_review(
             except Exception as exc:
                 ai_status = "error"
                 logger.warning("Vision model analysis failed (%s)", type(exc).__name__)
+    if ai_status != "complete":
+        text_findings = analyse(content, knowledge)
+        fallback_findings = deterministic + text_findings
+        deterministic.extend(text_findings)
+        deterministic.extend(analyse_unsupported_factual_claims(content, knowledge, fallback_findings))
     asset_id = secrets.token_hex(16)
     from .storage import put_object
     try:
@@ -1182,7 +1440,20 @@ async def visual_review(
         raise HTTPException(503, "Configured upload storage is unavailable") from exc
     asset = StoredAsset(organization_id=user.organization_id, original_name=(file.filename or "image")[:255], content_type=file.content_type or "application/octet-stream", storage_key=storage_key, size_bytes=len(data))
     db.add(asset); db.flush()
-    review = Review(organization_id=user.organization_id, creator_id=user.id, title=f"Visual review: {(file.filename or 'image')[:200]}", content=content, channel="Image", audience=role, goal=alt_text.strip(), ai_status=ai_status, status="checked")
+    reference_asset = None
+    if reference:
+        from .storage import delete_object
+        reference_asset_id = secrets.token_hex(16)
+        try:
+            reference_storage_key = put_object(user.organization_id, reference_asset_id, reference_logo.filename or "reference-logo", reference)
+        except Exception as exc:
+            delete_object(storage_key)
+            db.rollback()
+            logger.warning("Reference logo storage failed (%s)", type(exc).__name__)
+            raise HTTPException(503, "Configured upload storage is unavailable") from exc
+        reference_asset = StoredAsset(organization_id=user.organization_id, original_name=(reference_logo.filename or "reference-logo")[:255], content_type=reference_mime, storage_key=reference_storage_key, size_bytes=len(reference))
+        db.add(reference_asset); db.flush()
+    review = Review(organization_id=user.organization_id, creator_id=user.id, source_asset_id=asset.id, reference_asset_id=reference_asset.id if reference_asset else None, title=f"Visual review: {(file.filename or 'image')[:200]}", content=content, channel="Image", audience=role, goal=alt_text.strip(), ai_status=ai_status, status=review_workflow_status(ai_status, deterministic + ai_findings))
     db.add(review); db.flush()
     db.add(ReviewVersion(organization_id=user.organization_id, review_id=review.id, user_id=user.id, content=content))
     for finding in deterministic + ai_findings:
@@ -1191,10 +1462,12 @@ async def visual_review(
         review.status = "needs_review"
     audit(db, user, "review.visual_analysed", "review", review.id)
     audit(db, user, "asset.uploaded", "asset", asset.id)
+    if reference_asset:
+        audit(db, user, "asset.uploaded", "asset", reference_asset.id)
     db.commit(); db.refresh(review)
     response = serialize_review(review)
     response["asset_id"] = asset.id
-    response["analysis_note"] = " ".join(note for note in (extraction_note, visual_note) if note) or None
+    response["analysis_note"] = " ".join(note for note in (response.get("analysis_note"), extraction_note, visual_note) if note) or None
     return response
 
 
@@ -1214,13 +1487,11 @@ def delete_upload(asset_id: int, user: User = Depends(roles("admin")), db: Sessi
     asset = db.get(StoredAsset, asset_id)
     if not asset or asset.organization_id != user.organization_id:
         raise HTTPException(404, "Upload not found")
-    from .storage import delete_object
     try:
-        delete_object(asset.storage_key)
+        delete_stored_asset(db, asset, user)
     except Exception as exc:
         logger.warning("Upload deletion failed (%s)", type(exc).__name__)
-        raise HTTPException(503, "Configured upload storage is unavailable; metadata was retained") from exc
-    db.delete(asset); audit(db, user, "asset.deleted", "asset", asset_id); db.commit()
+        raise HTTPException(503, "Upload deletion did not complete; metadata and review links were preserved") from exc
     return {"id": asset_id, "deleted": True}
 
 
@@ -1256,4 +1527,4 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(db_sessi
     source_by_id = {source.id: source for source in knowledge}
     contested_rules = [{"id": source_id, "title": source_by_id[source_id].title, "dismissals_or_overrides": count}
                        for source_id, count in sorted(contested.items(), key=lambda item: -item[1]) if source_id in source_by_id]
-    return {"reviews": len(reviews), "needs_review": sum(r.status in {"needs_review", "submitted"} for r in reviews), "active_knowledge": sum(k.status == "active" for k in knowledge), "pending_knowledge": sum(k.status == "pending" for k in knowledge), "findings": len(all_findings), "finding_decisions": decisions, "dismissed_findings": decisions["dismissed"], "recurring_issues": sorted([{"type": k, "count": v} for k, v in counts.items()], key=lambda x: -x["count"]), "contested_rules": contested_rules, "guideline_gaps": guidance_gaps}
+    return {"reviews": len(reviews), "needs_review": sum(r.status in {"needs_review", "submitted", "analysis_incomplete"} for r in reviews), "analysis_incomplete": sum(r.ai_status != "complete" for r in reviews), "analysis_failed": sum(r.ai_status in {"error", "not_configured"} for r in reviews), "active_knowledge": sum(k.status == "active" for k in knowledge), "pending_knowledge": sum(k.status == "pending" for k in knowledge), "findings": len(all_findings), "finding_decisions": decisions, "dismissed_findings": decisions["dismissed"], "recurring_issues": sorted([{"type": k, "count": v} for k, v in counts.items()], key=lambda x: -x["count"]), "contested_rules": contested_rules, "guideline_gaps": guidance_gaps}

@@ -9,6 +9,10 @@ from urllib.parse import urlparse
 from .main import Settings, settings
 
 
+class StoredObjectNotFound(FileNotFoundError):
+    """The metadata exists but the private object is already absent."""
+
+
 def _safe_filename(filename: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", Path(filename).name)[:180] or "upload"
 
@@ -93,6 +97,39 @@ def delete_object(storage_key: str, config: Settings = settings) -> None:
     raise RuntimeError("Stored object provider does not match current storage configuration")
 
 
+def restore_object(storage_key: str, payload: bytes, config: Settings = settings) -> None:
+    """Restore an object at its original key when a surrounding DB deletion rolls back."""
+    if storage_key.startswith("local:"):
+        path = Path(storage_key[6:]).resolve()
+        root = Path(config.upload_dir).resolve()
+        if root not in path.parents:
+            raise RuntimeError("Stored local object is outside the configured upload directory")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return
+    if storage_key.startswith("s3:"):
+        client = _s3_client(config)
+        key = storage_key[3:]
+        put_args = {"Bucket": config.s3_bucket, "Key": key, "Body": payload}
+        encryption = config.s3_server_side_encryption.strip()
+        endpoint_host = urlparse(config.s3_endpoint_url).hostname or ""
+        is_cloudflare_r2 = endpoint_host.endswith(".r2.cloudflarestorage.com")
+        is_supabase = _is_supabase_storage(config)
+        if is_cloudflare_r2 or is_supabase:
+            encryption = ""
+        if encryption:
+            if encryption not in {"AES256", "aws:kms"}:
+                raise RuntimeError("S3_SERVER_SIDE_ENCRYPTION must be AES256, aws:kms, or empty")
+            put_args["ServerSideEncryption"] = encryption
+            if encryption == "aws:kms":
+                if not config.s3_sse_kms_key_id:
+                    raise RuntimeError("S3_SSE_KMS_KEY_ID is required when using aws:kms encryption")
+                put_args["SSEKMSKeyId"] = config.s3_sse_kms_key_id
+        client.put_object(**put_args)
+        return
+    raise RuntimeError("Stored object provider does not match current storage configuration")
+
+
 def get_object(storage_key: str, config: Settings = settings) -> bytes:
     """Read an object for server-side processing; never expose a public object URL."""
     if storage_key.startswith("local:"):
@@ -100,10 +137,21 @@ def get_object(storage_key: str, config: Settings = settings) -> bytes:
         root = Path(config.upload_dir).resolve()
         if root not in path.parents:
             raise RuntimeError("Stored local object is outside the configured upload directory")
-        return path.read_bytes()
+        try:
+            return path.read_bytes()
+        except FileNotFoundError as exc:
+            raise StoredObjectNotFound("Stored local object is missing") from exc
     if storage_key.startswith("s3:"):
         client = _s3_client(config)
-        response = client.get_object(Bucket=config.s3_bucket, Key=storage_key[3:])
+        try:
+            response = client.get_object(Bucket=config.s3_bucket, Key=storage_key[3:])
+        except Exception as exc:
+            error = getattr(exc, "response", {})
+            code = error.get("Error", {}).get("Code")
+            status = error.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in {"NoSuchKey", "NotFound", "404"} or status == 404:
+                raise StoredObjectNotFound("Stored S3 object is missing") from exc
+            raise
         body = response["Body"]
         try:
             return body.read()

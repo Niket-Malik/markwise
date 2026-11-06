@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { analysisLabel, cleanReview, findingsLabel } from "../app/review-status.mjs";
 
 const html = await readFile(new URL("../.next/server/app/index.html", import.meta.url), "utf8");
 const cssPath = html.match(/href="([^\"]+\.css)"/)?.[1];
@@ -35,4 +36,22 @@ test("keyboard focus indicator has readable contrast against white", () => {
   const luminance = channels.map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
   const ratio = 1.05 / (0.2126 * luminance[0] + 0.7152 * luminance[1] + 0.0722 * luminance[2] + 0.05);
   assert.ok(ratio >= 3, `focus indicator contrast ${ratio.toFixed(2)}:1 should meet the 3:1 non-text contrast criterion`);
+});
+
+test("only a completed AI analysis with zero findings is presented as clean", () => {
+  assert.equal(cleanReview("complete", 0), true);
+  assert.equal(findingsLabel("complete", 0), "No conflicts found");
+  assert.equal(cleanReview("error", 0), false);
+  assert.equal(findingsLabel("error", 0), "Fallback review · incomplete");
+  assert.equal(cleanReview("disabled", 0), false);
+  assert.equal(findingsLabel("disabled", 0), "Fallback review · incomplete");
+  assert.equal(findingsLabel("error", 2), "2 fallback findings");
+});
+
+test("review list exposes pending, failed, fallback, and source-insufficient analysis states", () => {
+  assert.equal(analysisLabel("complete"), "AI Review Completed");
+  assert.equal(analysisLabel("retrying"), "AI Analysis Pending/Retrying");
+  assert.equal(analysisLabel("error"), "AI Analysis Failed");
+  assert.equal(analysisLabel("disabled"), "Knowledge Base Fallback Review");
+  assert.equal(findingsLabel("no_sources", 0), "CANNOT VERIFY");
 });

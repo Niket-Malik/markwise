@@ -157,6 +157,27 @@ def test_retries_are_bounded_exponential_jittered_and_honor_retry_after(monkeypa
     assert delays == [2, 2]
 
 
+def test_bounded_provider_retry_can_recover_on_the_same_analysis_request(monkeypatch):
+    config = Settings(ai_provider="gemini", gemini_api_key="test", ai_fallback_api_key="test",
+                      ai_provider_max_retries=2, ai_retry_base_seconds=0, ai_retry_max_seconds=0,
+                      ai_circuit_breaker_failures=10)
+    monkeypatch.setattr(ai.time, "sleep", lambda _delay: None)
+
+    class FlakyProvider:
+        name = "gemini"; capabilities = {"text", "vision"}
+        def __init__(self, _): self.calls = 0
+        def analyse(self, *_, model=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
+            return ai.AnalysisResponse(findings=[])
+
+    provider = FlakyProvider(config)
+    result = ai.FailoverProvider(config)._attempt_provider_model(provider, "analyse", ("draft", {}, []), "gemini-3.8-flash")
+    assert result.findings == []
+    assert provider.calls == 2
+
+
 def test_primary_recovers_after_cooldown_and_becomes_active(monkeypatch):
     config = Settings(ai_provider="gemini", gemini_api_key="gemini-test", ai_fallback_api_key="openai-test",
                       embedding_model="text-embedding-3-small", ai_provider_max_retries=0,

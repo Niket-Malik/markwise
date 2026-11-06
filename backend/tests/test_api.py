@@ -248,6 +248,394 @@ def test_external_analysis_requires_workspace_opt_in_and_validates_citations(cli
     assert any(f["kind"] == "cannot_verify" and "99999" not in f["citation"] for f in invalid["findings"])
 
 
+def test_ai_failure_runs_cited_knowledge_fallback_and_never_reports_clean(client, monkeypatch):
+    import backend.app.main as main
+    import backend.app.ai as ai
+
+    token = register(client, "Fallback Co", "fallback-admin@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    rule = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "No guarantees", "body": "guaranteed", "source": "Approved Voice Guide", "passage": "Never promise guaranteed outcomes."}).json()
+    client.post(f"/api/knowledge/{rule['id']}/approve", headers=headers)
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main.settings, "embedding_model", "")
+
+    def unavailable():
+        raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
+
+    monkeypatch.setattr(ai, "provider_from_config", unavailable)
+    response = client.post("/api/reviews", headers=headers, json={"title": "Fallback draft", "content": "Our guaranteed product is ready."})
+    assert response.status_code == 200
+    review = response.json()
+    assert review["status"] == "analysis_incomplete"
+    assert review["ai_status"] == "error"
+    assert review["analysis_mode"] == "knowledge_base_fallback"
+    assert review["analysis_state"] == "failed"
+    assert review["clean_review"] is False
+    assert "Knowledge Base Fallback Review" in review["analysis_note"]
+    assert "AI Analysis Unavailable" in review["ai_message"]
+    finding = next(item for item in review["findings"] if item["kind"] == "restricted_term")
+    assert "Approved Voice Guide" in finding["citation"]
+
+    dashboard = client.get("/api/dashboard", headers=headers).json()
+    assert dashboard["analysis_incomplete"] == 1
+    assert dashboard["analysis_failed"] == 1
+    assert dashboard["needs_review"] == 1
+
+
+def test_successful_zero_finding_ai_analysis_is_the_only_clean_result(client, monkeypatch):
+    import backend.app.main as main
+    import backend.app.ai as ai
+
+    token = register(client, "Clean Co", "clean-admin@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    source = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Product wording", "body": "Use plain language.", "source": "Style guide", "passage": "Describe product features clearly."}).json()
+    client.post(f"/api/knowledge/{source['id']}/approve", headers=headers)
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main.settings, "embedding_model", "")
+
+    class EmptyProvider:
+        def analyse(self, content, context, sources):
+            assert any(item.id == source["id"] for item in sources)
+            return ai.AnalysisResponse(findings=[])
+
+    monkeypatch.setattr(ai, "provider_from_config", lambda: EmptyProvider())
+    response = client.post("/api/reviews", headers=headers, json={"title": "Clean draft", "content": "Our product supports thoughtful teams."})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["ai_status"] == "complete"
+    assert result["analysis_state"] == "completed"
+    assert result["clean_review"] is True
+    assert result["findings"] == []
+    assert result["status"] == "checked"
+
+
+def test_empty_knowledge_fallback_explicitly_cannot_verify(client, monkeypatch):
+    import backend.app.main as main
+    import backend.app.ai as ai
+
+    token = register(client, "No Evidence Co", "no-evidence@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main.settings, "embedding_model", "")
+
+    def unavailable():
+        raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
+
+    monkeypatch.setattr(ai, "provider_from_config", unavailable)
+    result = client.post("/api/reviews", headers=headers, json={"title": "Unverified draft", "content": "A welcoming brand for every team."}).json()
+    assert result["ai_status"] == "error"
+    assert result["findings"] == []
+    assert result["clean_review"] is False
+    assert "CANNOT VERIFY" in result["analysis_note"]
+    assert "not a complete AI-powered review" in result["analysis_note"]
+
+
+def test_fallback_marks_nonpercentage_factual_claim_cannot_verify(client):
+    token = register(client, "Claim Check Co", "claim-check@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    result = client.post("/api/reviews", headers=headers, json={
+        "title": "Unsupported claim", "content": "Our platform doubles customer retention for every retailer."
+    }).json()
+    finding = next(item for item in result["findings"] if item["kind"] == "cannot_verify")
+    assert finding["excerpt"] == "Our platform doubles customer retention for every retailer."
+    assert "CANNOT VERIFY" in finding["explanation"]
+    assert finding["citation"] == "No matching active approved fact in this workspace."
+    assert result["clean_review"] is False
+
+
+def test_fallback_verifies_exact_approved_claim_but_abstains_on_other_claim(client):
+    token = register(client, "Mixed Claims Co", "mixed-claims@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    fact = client.post("/api/knowledge", headers=headers, json={
+        "kind": "fact", "title": "Sales for local shops", "body": "Our product doubles sales for local shops.",
+        "source": "Approved customer study", "passage": "Our product doubles sales for local shops."
+    }).json()
+    client.post(f"/api/knowledge/{fact['id']}/approve", headers=headers)
+    rule = client.post("/api/knowledge", headers=headers, json={
+        "kind": "rule", "title": "No guarantees", "body": "guaranteed",
+        "source": "Approved voice guide", "passage": "Do not promise guaranteed outcomes."
+    }).json()
+    client.post(f"/api/knowledge/{rule['id']}/approve", headers=headers)
+    result = client.post("/api/reviews", headers=headers, json={
+        "title": "Two factual claims",
+        "content": "Our product doubles sales for local shops. Our product doubles retention at large retailers. The service is guaranteed."
+    }).json()
+    cannot_verify = [item for item in result["findings"] if item["kind"] == "cannot_verify"]
+    assert any(item["kind"] == "restricted_term" for item in result["findings"])
+    assert len(cannot_verify) == 1
+    assert cannot_verify[0]["excerpt"] == "Our product doubles retention at large retailers."
+    assert f"FACT #{fact['id']}" in cannot_verify[0]["citation"]
+    assert "does not substantiate this claim" in cannot_verify[0]["citation"]
+    assert result["clean_review"] is False
+
+
+def test_fallback_never_retrieves_another_workspace_fact(client):
+    first_token = register(client, "Private Evidence Co", "private-evidence@example.test")
+    first_headers = {"Authorization": f"Bearer {first_token}"}
+    fact = client.post("/api/knowledge", headers=first_headers, json={
+        "kind": "fact", "title": "Private sales result", "body": "Our platform doubles sales for private clients.",
+        "source": "Private workspace study", "passage": "Private workspace evidence."
+    }).json()
+    client.post(f"/api/knowledge/{fact['id']}/approve", headers=first_headers)
+
+    second_token = register(client, "Separate Workspace Co", "separate-workspace@example.test")
+    second_headers = {"Authorization": f"Bearer {second_token}"}
+    result = client.post("/api/reviews", headers=second_headers, json={
+        "title": "Isolated claim", "content": "Our platform doubles sales for private clients."
+    }).json()
+    finding = next(item for item in result["findings"] if item["kind"] == "cannot_verify")
+    assert "Private workspace study" not in finding["citation"]
+    assert finding["citation"] == "No matching active approved fact in this workspace."
+
+
+def _create_test_asset(client, headers, monkeypatch, tmp_path, main, filename="reference.png"):
+    import io
+    from PIL import Image
+
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr(main.settings, "storage_backend", "local")
+    image = Image.new("RGB", (32, 24), "#345678")
+    buffer = io.BytesIO(); image.save(buffer, format="PNG")
+    return client.post("/api/uploads", headers=headers, files={"file": (filename, buffer.getvalue(), "image/png")}).json()
+
+
+def test_admin_deleting_review_asset_detaches_link_and_preserves_review_data(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    token = register(client, "Asset Delete Co", "asset-delete@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main)
+    reference_asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main, "logo-reference.png")
+    review = client.post("/api/reviews", headers=headers, json={
+        "title": "Keep this review", "content": "Our sales rose by 17%."
+    }).json()
+    assert review["findings"]
+    client.post(f"/api/reviews/{review['id']}/comments", headers=headers, json={"body": "Keep this discussion."})
+    with client.session_factory() as db:
+        row = db.get(main.Review, review["id"])
+        row.source_asset_id = asset["id"]
+        row.reference_asset_id = reference_asset["id"]
+        asset_row = db.get(main.StoredAsset, asset["id"])
+        storage_path = asset_row.storage_key[6:]
+        reference_path = db.get(main.StoredAsset, reference_asset["id"]).storage_key[6:]
+        db.commit()
+
+    removed = client.delete(f"/api/uploads/{asset['id']}", headers=headers)
+    assert removed.status_code == 200
+    assert removed.json()["deleted"] is True
+    with client.session_factory() as db:
+        kept_review = db.get(main.Review, review["id"])
+        assert kept_review.source_asset_id is None
+        assert kept_review.reference_asset_id == reference_asset["id"]
+        assert db.get(main.StoredAsset, asset["id"]) is None
+        assert db.get(main.StoredAsset, reference_asset["id"]) is not None
+        assert [finding.id for finding in kept_review.findings] == [finding["id"] for finding in review["findings"]]
+        assert db.query(main.AuditEvent).filter_by(entity_type="asset", entity_id=asset["id"], action="asset.deleted").count() == 1
+    serialized = client.get("/api/reviews", headers=headers).json()[0]
+    assert serialized["id"] == review["id"]
+    assert serialized["content"] == review["content"]
+    assert [item["id"] for item in serialized["findings"]] == [item["id"] for item in review["findings"]]
+    assert client.get(f"/api/reviews/{review['id']}/comments", headers=headers).json()[0]["body"] == "Keep this discussion."
+    assert not __import__("pathlib").Path(storage_path).exists()
+    assert __import__("pathlib").Path(reference_path).exists()
+    assert client.delete(f"/api/uploads/{reference_asset['id']}", headers=headers).status_code == 200
+    with client.session_factory() as db:
+        assert db.get(main.Review, review["id"]).reference_asset_id is None
+
+
+def test_admin_deleting_unreferenced_asset_succeeds(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    token = register(client, "Unreferenced Asset Co", "unreferenced-asset@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main)
+    assert client.delete(f"/api/uploads/{asset['id']}", headers=headers).json()["deleted"] is True
+    with client.session_factory() as db:
+        assert db.get(main.StoredAsset, asset["id"]) is None
+
+
+def test_admin_can_remove_metadata_for_already_missing_object(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    from pathlib import Path
+
+    token = register(client, "Missing Object Co", "missing-object@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main)
+    with client.session_factory() as db:
+        path = Path(db.get(main.StoredAsset, asset["id"]).storage_key[6:])
+    path.unlink()
+    response = client.delete(f"/api/uploads/{asset['id']}", headers=headers)
+    assert response.status_code == 200
+    with client.session_factory() as db:
+        assert db.get(main.StoredAsset, asset["id"]) is None
+
+
+def test_storage_delete_failure_preserves_asset_and_review_references(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    import backend.app.storage as storage
+
+    token = register(client, "Storage Failure Co", "storage-failure@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main)
+    review = client.post("/api/reviews", headers=headers, json={"title": "Retain link", "content": "A saved review."}).json()
+    with client.session_factory() as db:
+        row = db.get(main.Review, review["id"])
+        row.source_asset_id = asset["id"]
+        storage_path = db.get(main.StoredAsset, asset["id"]).storage_key[6:]
+        db.commit()
+
+    def fail_delete(*args, **kwargs):
+        raise RuntimeError("simulated storage outage")
+
+    monkeypatch.setattr(storage, "delete_object", fail_delete)
+    response = client.delete(f"/api/uploads/{asset['id']}", headers=headers)
+    assert response.status_code == 503
+    with client.session_factory() as db:
+        assert db.get(main.StoredAsset, asset["id"]) is not None
+        assert db.get(main.Review, review["id"]).source_asset_id == asset["id"]
+        assert db.query(main.AuditEvent).filter_by(entity_type="asset", entity_id=asset["id"], action="asset.deleted").count() == 0
+    from pathlib import Path
+    assert Path(storage_path).exists()
+
+
+def test_database_failure_after_storage_delete_restores_asset_and_references(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    import backend.app.storage as storage
+    from pathlib import Path
+
+    token = register(client, "Database Failure Co", "database-failure@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main)
+    review = client.post("/api/reviews", headers=headers, json={"title": "Keep reference", "content": "A saved review."}).json()
+    with client.session_factory() as db:
+        db.get(main.Review, review["id"]).source_asset_id = asset["id"]
+        storage_path = Path(db.get(main.StoredAsset, asset["id"]).storage_key[6:])
+        db.commit()
+
+    original_audit = main.audit
+
+    def fail_delete_audit(db, user, action, entity, entity_id):
+        if action == "asset.deleted":
+            raise RuntimeError("simulated database transaction failure")
+        return original_audit(db, user, action, entity, entity_id)
+
+    monkeypatch.setattr(main, "audit", fail_delete_audit)
+    response = client.delete(f"/api/uploads/{asset['id']}", headers=headers)
+    assert response.status_code == 503
+    with client.session_factory() as db:
+        assert db.get(main.StoredAsset, asset["id"]) is not None
+        assert db.get(main.Review, review["id"]).source_asset_id == asset["id"]
+    assert storage_path.exists()
+
+
+def test_workspace_admin_cannot_delete_another_workspaces_asset(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+
+    owner_token = register(client, "Asset Owner Co", "asset-owner@example.test")
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, owner_headers, monkeypatch, tmp_path, main)
+    outsider_token = register(client, "Outsider Co", "asset-outsider@example.test")
+    outsider_headers = {"Authorization": f"Bearer {outsider_token}"}
+    assert client.delete(f"/api/uploads/{asset['id']}", headers=outsider_headers).status_code == 404
+    with client.session_factory() as db:
+        assert db.get(main.StoredAsset, asset["id"]) is not None
+
+
+def test_retention_detaches_expired_visual_asset_without_deleting_review(client, monkeypatch, tmp_path):
+    import backend.app.main as main
+    import backend.app.retention as retention
+
+    token = register(client, "Visual Retention Co", "visual-retention@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.put("/api/settings/retention", headers=headers, json={"upload_retention_days": 1, "review_retention_days": 0})
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "")
+    asset = _create_test_asset(client, headers, monkeypatch, tmp_path, main)
+    review = client.post("/api/reviews", headers=headers, json={"title": "Persistent review", "content": "Our sales rose by 17%."}).json()
+    with client.session_factory() as db:
+        db.get(main.Review, review["id"]).source_asset_id = asset["id"]
+        db.get(main.StoredAsset, asset["id"]).created_at = datetime.now(timezone.utc) - timedelta(days=2)
+        db.commit()
+    monkeypatch.setattr(retention, "SessionLocal", client.session_factory)
+    assert retention.purge_expired_uploads() == 1
+    with client.session_factory() as db:
+        kept_review = db.get(main.Review, review["id"])
+        assert kept_review is not None
+        assert kept_review.source_asset_id is None
+        assert len([finding for finding in kept_review.findings if finding.status != "stale"]) == len(review["findings"])
+
+
+def test_manual_retry_recovers_ai_without_duplicate_review_or_findings(client, monkeypatch):
+    import backend.app.main as main
+    import backend.app.ai as ai
+
+    token = register(client, "Retry Co", "retry-admin@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    rule = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "No guarantees", "body": "guaranteed", "source": "Voice Guide", "passage": "Do not guarantee outcomes."}).json()
+    client.post(f"/api/knowledge/{rule['id']}/approve", headers=headers)
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main.settings, "embedding_model", "")
+
+    def unavailable():
+        raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
+
+    monkeypatch.setattr(ai, "provider_from_config", unavailable)
+    failed = client.post("/api/reviews", headers=headers, json={"title": "Retry draft", "content": "Our guaranteed product is ready."}).json()
+    old_ids = {item["id"] for item in failed["findings"]}
+    assert failed["ai_status"] == "error"
+
+    class RecoveredProvider:
+        def analyse(self, content, context, sources):
+            assert any(source.id == rule["id"] for source in sources)
+            return ai.AnalysisResponse(findings=[ai.CandidateFinding(
+                kind="legal", excerpt="guaranteed", explanation="The approved guide prohibits guarantees.",
+                severity="high", confidence=0.9, cited_source_ids=[rule["id"]],
+            )])
+
+    monkeypatch.setattr(ai, "provider_from_config", lambda: RecoveredProvider())
+    retried = client.post(f"/api/reviews/{failed['id']}/retry-ai", headers=headers)
+    assert retried.status_code == 200
+    result = retried.json()
+    assert result["ai_status"] == "complete"
+    assert result["analysis_state"] == "completed"
+    assert result["clean_review"] is False
+    assert len(client.get("/api/reviews", headers=headers).json()) == 1
+    assert len(result["findings"]) == len({(item["kind"], item["excerpt"]) for item in result["findings"]})
+    assert old_ids.intersection({item["id"] for item in result["findings"]})
+    assert any(item["kind"] == "ai_legal" and "Voice Guide" in item["citation"] for item in result["findings"])
+    assert client.post(f"/api/reviews/{failed['id']}/retry-ai", headers=headers).status_code == 409
+
+
+def test_failed_manual_retry_preserves_fallback_and_reports_cannot_verify(client, monkeypatch):
+    import backend.app.main as main
+    import backend.app.ai as ai
+
+    token = register(client, "Abstain Co", "abstain-admin@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main.settings, "embedding_model", "")
+
+    def unavailable():
+        raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
+
+    monkeypatch.setattr(ai, "provider_from_config", unavailable)
+    created = client.post("/api/reviews", headers=headers, json={"title": "Unsupported number", "content": "We increase sales by 85%."}).json()
+    assert created["ai_status"] == "error"
+    assert any(item["kind"] == "cannot_verify" for item in created["findings"])
+    before = {(item["kind"], item["excerpt"], item["id"]) for item in created["findings"]}
+    retried = client.post(f"/api/reviews/{created['id']}/retry-ai", headers=headers)
+    assert retried.status_code == 200
+    after = {(item["kind"], item["excerpt"], item["id"]) for item in retried.json()["findings"]}
+    assert retried.json()["ai_status"] == "error"
+    assert retried.json()["clean_review"] is False
+    assert before == after
+
+
 def test_ai_abstains_on_unsourced_nonpercentage_claim(client, monkeypatch):
     import backend.app.main as main
 
@@ -531,6 +919,50 @@ def test_visual_review_uses_approved_sources_and_validated_vision_output(client,
     assert result.json()["ai_status"] == "complete"
     finding = next(f for f in result.json()["findings"] if f["kind"] == "ai_contrast")
     assert "Infographic contrast" in finding["citation"]
+
+
+def test_manual_image_retry_reuses_private_asset_without_duplicate_review(client, monkeypatch, tmp_path):
+    import io
+    import backend.app.main as main
+    import backend.app.ai as ai
+    from PIL import Image
+
+    token = register(client, "Visual Retry Co", "visual-retry@example.test")
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(main.settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr("pytesseract.image_to_string", lambda *args, **kwargs: "A product illustration")
+    monkeypatch.setattr("pytesseract.image_to_data", lambda *args, **kwargs: {"text": [], "conf": [], "left": [], "top": [], "width": [], "height": []})
+    image = Image.new("RGB", (64, 48), "#224466")
+    buffer = io.BytesIO(); image.save(buffer, format="PNG")
+    source = client.post("/api/knowledge", headers=headers, json={"kind": "rule", "title": "Visual clarity", "body": "Keep product graphics clear.", "source": "Design guide", "passage": "Use clear, legible imagery."}).json()
+    client.post(f"/api/knowledge/{source['id']}/approve", headers=headers)
+    client.put("/api/settings/privacy", headers=headers, json={"external_ai_enabled": True})
+    monkeypatch.setattr(main.settings, "embedding_model", "")
+    monkeypatch.setattr(main.settings, "vision_model", "vision-test")
+
+    def unavailable():
+        raise ai.ProviderRequestError("gemini", "temporarily unavailable", True)
+
+    monkeypatch.setattr(ai, "provider_from_config", unavailable)
+    created = client.post("/api/visual-reviews", headers=headers,
+                          data={"role": "informative", "alt_text": "A product illustration"},
+                          files={"file": ("product.png", buffer.getvalue(), "image/png")}).json()
+    assert created["ai_status"] == "error"
+    assert created["analysis_mode"] == "knowledge_base_fallback"
+
+    class RecoveredVisionProvider:
+        def analyse_image(self, data, mime, context, sources, reference_data=None, reference_mime="image/png"):
+            assert data.startswith(b"\x89PNG")
+            assert mime == "image/png"
+            assert any(item.id == source["id"] for item in sources)
+            return ai.AnalysisResponse(findings=[])
+
+    monkeypatch.setattr(ai, "provider_from_config", lambda: RecoveredVisionProvider())
+    retried = client.post(f"/api/reviews/{created['id']}/retry-ai", headers=headers)
+    assert retried.status_code == 200
+    assert retried.json()["ai_status"] == "complete"
+    assert retried.json()["clean_review"] is True
+    assert len(client.get("/api/reviews", headers=headers).json()) == 1
 
 
 def test_provider_status_is_admin_only_and_never_returns_credentials(client, monkeypatch):

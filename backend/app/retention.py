@@ -5,8 +5,7 @@ import logging
 
 from sqlalchemy import or_, select
 
-from .main import Organization, Review, SessionLocal, StoredAsset, remove_review_records, settings
-from .storage import delete_object
+from .main import Organization, Review, SessionLocal, StoredAsset, delete_stored_asset, remove_review_records
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +24,10 @@ def purge_expired_uploads(now: datetime | None = None) -> int:
                 )).all()
                 for asset in assets:
                     try:
-                        delete_object(asset.storage_key, settings)
+                        delete_stored_asset(db, asset)
                     except Exception as exc:
                         logger.error("Retention could not delete asset %s (%s)", asset.id, type(exc).__name__)
                         continue
-                    db.delete(asset)
                     deleted += 1
             if organization.review_retention_days > 0:
                 review_cutoff = now - timedelta(days=organization.review_retention_days)
