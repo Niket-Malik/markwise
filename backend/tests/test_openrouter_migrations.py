@@ -17,6 +17,31 @@ def load_migration(filename):
     return module
 
 
+def test_all_migration_revision_ids_fit_alembic_version_and_form_one_chain():
+    migrations = [load_migration(path.name) for path in sorted(MIGRATIONS.glob("*.py"))]
+    revisions = [migration.revision for migration in migrations]
+    revision_set = set(revisions)
+
+    assert all(len(revision) <= 32 for revision in revisions)
+    assert len(revision_set) == len(revisions)
+    assert all(
+        migration.down_revision is None or migration.down_revision in revision_set
+        for migration in migrations
+    )
+    assert sum(migration.down_revision is None for migration in migrations) == 1
+    assert sum(
+        migration.revision not in {item.down_revision for item in migrations}
+        for migration in migrations
+    ) == 1
+
+    migration_0007 = load_migration("0007_openrouter_embedding_space.py")
+    migration_0008 = load_migration("0008_workspace_consent_generation.py")
+    assert migration_0007.revision == "0007_openrouter_embedding_space"
+    assert migration_0007.down_revision == "0006_review_visual_assets"
+    assert migration_0008.revision == "0008_consent_generation"
+    assert migration_0008.down_revision == migration_0007.revision
+
+
 def test_0007_upgrade_and_downgrade_generate_postgresql_sql_in_safe_order():
     migration = load_migration("0007_openrouter_embedding_space.py")
     output = io.StringIO()

@@ -4,7 +4,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0008_workspace_consent_generation"
+revision = "0008_consent_generation"
 down_revision = "0007_openrouter_embedding_space"
 branch_labels = None
 depends_on = None
