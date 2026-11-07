@@ -1,67 +1,89 @@
 # Deployment guide
 
-## Current deployment state
+## Deployment state
 
-No public deployment has been created or verified. A GitHub `origin/main` ref is present, but its visibility/ownership and Render authorization are unverified; Docker is unavailable. `render.yaml` prepares a Render Blueprint with a FastAPI Docker web service, a Next.js Docker web service, and a daily retention cron job. It expects a Git repository connected to Render and the external secrets listed below. Never treat the planned service names or hostnames as live URLs.
+Markwise is already deployed and running. For access to the live application or backend URLs, please contact the project owner. No deployed URLs are included in this repository documentation. This documentation update did not probe the live services or inspect the current managed-service configuration. The repository also has a Render Blueprint for Docker FastAPI and Next.js services plus a daily retention cron job; that Blueprint documents deployable configuration and does not itself verify current service health.
+
+The latest production Alembic revision explicitly reported by the owner in the migration troubleshooting history was `0006_review_visual_assets`; a failed attempt to upgrade beyond it rolled back. The current checked-in code has migration head `0008_consent_generation`. Confirm the production revision read-only before deploying/applying migrations. Do not assume production is at head.
 
 ## Prepared architecture
 
-- Render Singapore region: FastAPI backend (`/health`), Next.js frontend, and daily retention worker. Render terminates HTTPS. The API image runs Alembic in the pre-deploy phase; web startup runs Uvicorn only. The cron invokes `python -m app.retention` at 04:15 UTC daily.
-- Neon PostgreSQL with `vector` extension: configure the Neon pooled connection string as `DATABASE_URL`. Runtime and Alembic convert Neon’s standard `postgresql://`/`postgres://` URL to `postgresql+psycopg://`. Use SSL (`sslmode=require`) and enable pgvector; migrations also create the extension if permitted. Do not expose a database port publicly.
-- Supabase Storage S3: keep bucket `markwise-assets` private. Configure the project endpoint and region copied from Supabase Project Settings → Storage → S3, plus the generated server-side access key pair. The app uses HTTPS, Signature V4, path-style requests, and omits unsupported SSE headers. Supabase-generated S3 keys are server-only and bypass bucket RLS; never expose them to the frontend.
-- AI providers: OpenRouter `nvidia/nemotron-3.5-super-vl:free` is primary for text and vision through `/api/v1/chat/completions`; Gemini `gemini-3.5-flash` → `gemini-3.5-flash-lite` is the configured secondary. Nemotron Super VL accepts text/images and OpenRouter JSON-schema structured output. OpenRouter free services may log prompts and use data to improve services, so a workspace admin must explicitly enable both external AI and the separate OpenRouter free-provider consent before its data is sent there. Without OpenRouter consent, the app may use configured Gemini only.
-- Embeddings use OpenRouter `nvidia/nemotron-3.5-embed-1b:free` at exactly 1536 dimensions through `/api/v1/embeddings`, with `input_type=query` for searches and `passage` for indexed chunks. The provider documents a 2048-D model with truncation. Markwise requests 1536 and re-normalizes the returned vector; the PostgreSQL `vector(1536)` column remains unchanged. Migration 0007 tags embedding spaces; old OpenAI vectors are ignored and require opted-in re-embedding before semantic retrieval uses them. A failed bounded backfill leaves chunks lexical-only and can be resumed by a workspace admin through `POST /api/settings/embeddings/backfill`; there are no automatic periodic retries. Downgrading below 0007 clears rebuildable `knowledge_chunks.embedding` vectors before dropping the space tag, while preserving source text and knowledge records.
-- Migration 0008 adds separate monotonic workspace consent generations for general external AI and OpenRouter. Both are re-checked at the outbound provider boundary. Revoking OpenRouter-specific consent prevents subsequent OpenRouter requests while allowing Gemini only if general external-AI consent remains unchanged; withdrawing general consent blocks both providers. Revocation invalidates stale in-flight results before they are used/persisted; an already transmitted request cannot be cancelled. OpenRouter's request budget and the API HTTP rate limiter are process-local, so they are not global across workers/instances; configure edge-level protection when scaling, without assuming the local budget is shared.
-- An explicitly configured legacy `AI_PROVIDER=openai` or `openai_compatible` remains supported only when OpenRouter and Gemini are not configured, and it still requires the workspace's general external-AI consent at each outbound call. When OpenRouter and/or Gemini are configured, the production chain is OpenRouter first and Gemini second; legacy OpenAI settings cannot bypass that order.
+- **Render:** Backend Docker Web Service (`/health`), frontend Docker Web Service, and daily retention Cron Job. Render terminates HTTPS. The Blueprint has an Alembic pre-deploy command for the backend service and runs `python -m app.retention` in the cron service at 04:15 UTC daily. The cron service must receive the same database and S3 environment configuration as the backend.
+- **Neon PostgreSQL:** Set `DATABASE_URL` to the pooled PostgreSQL URL with TLS (`sslmode=require`). SQLAlchemy and Alembic use psycopg 3 and normalize PostgreSQL URL schemes. Enable pgvector; migrations create the extension if the database role permits. The current embedding column is `vector(1536)`.
+- **Supabase Storage S3:** Use the private `markwise-assets` bucket and endpoint/region from Supabase Project Settings → Storage → S3. Configure `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY`. The adapter uses HTTPS, Signature V4, and path-style addressing. Keep the generated server-side keys private; they bypass bucket RLS. Keep `S3_SERVER_SIDE_ENCRYPTION` empty for Supabase because its S3 endpoint rejects the SSE request header.
+- **AI analysis:** OpenRouter `nvidia/nemotron-3.5-super-vl:free` is primary for text and vision; Gemini `gemini-3.5-flash` is secondary with `gemini-3.5-flash-lite` alternate for text and vision. OpenRouter uses structured JSON and image input. OpenRouter free processing may log/use inputs to improve provider products. Admins must enable both workspace consent settings before OpenRouter is used. If OpenRouter-specific consent is off but general external-AI consent is on, configured Gemini may serve analysis; embeddings remain unavailable because the embedding provider is OpenRouter-only. Live provider/model availability and quota depend on the configured accounts.
+- **Embedding and recovery:** OpenRouter `nvidia/nemotron-3.5-embed-1b:free` is requested at 1536 dimensions and stored in the existing pgvector column. Indexing and query input types are differentiated. Migration 0007 tags embedding spaces so incompatible vectors are not mixed; migration 0008 adds monotonic consent generations. Consent is rechecked before outbound requests. A request already sent to a provider cannot be recalled.
+- **Retention and request limits:** Review/upload retention is per workspace; `0` disables automatic expiry. Compose includes a retention loop and Render schedules the daily job. API request limits and the OpenRouter budget are in-process; they are not global across replicas. Configure edge/shared limits before scaling.
+- **Frontend branding:** The forest-green M plus verification-check mark is served as `frontend/public/icon.svg` and `favicon.ico` (16/32/48px), with `apple-touch-icon.png` (180×180), `icon-192.png`, `icon-512.png`, and `site.webmanifest` for supported mobile shortcuts. `frontend/app/layout.tsx` declares the title “Markwise – Intelligent Brand Governance Platform” and icon metadata for browser tabs/bookmarks and Apple devices. The frontend Docker build includes these public assets. A Render redeploy is needed before a new local icon change appears in the deployed app; browser icon caches may take time to refresh.
 
-## Deploy steps requiring account access
+## Required environment configuration
 
-1. Confirm the existing `origin` is the intended private repository, verify its visibility/ownership, and authorize Render to access it. One commit is present on `origin/main`. This task does not publish any code. Do not commit `.env` or secrets.
-2. In Render, create a Blueprint from the repository’s `render.yaml`. Review the service plans and estimated cost before accepting; the API plan is configured as `1c-2g`, and the frontend/cron use `0.5c-512mb`.
-3. Create or select a Neon project, enable pgvector, and provide its pooled connection string as the Blueprint’s `DATABASE_URL` secret. Keep `sslmode=require` in the URL.
-4. Use the private Supabase `markwise-assets` bucket and generated `markwise-backend` S3 key pair. Set `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY` in Render secret settings.
-5. Set protected AI values: `AI_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, `OPENROUTER_API_BASE_URL=https://openrouter.ai/api/v1`, `OPENROUTER_TEXT_MODEL=nvidia/nemotron-3.5-super-vl:free`, `OPENROUTER_VISION_MODEL=nvidia/nemotron-3.5-super-vl:free`, optional Gemini `GEMINI_API_KEY`, `GEMINI_TEXT_MODEL=gemini-3.5-flash`, `GEMINI_VISION_MODEL=gemini-3.5-flash`, and both Gemini alternate variables set to `gemini-3.5-flash-lite`. Gemini 3.5 Flash and Flash-Lite support the configured Interactions API text, image-input, and structured JSON flow. Also set `EMBEDDING_PROVIDER=openrouter`, `EMBEDDING_MODEL=nvidia/nemotron-3.5-embed-1b:free`, and `EMBEDDING_DIMENSIONS=1536`. Retry/circuit and `OPENROUTER_MAX_REQUESTS_PER_MINUTE` settings are in `backend/.env.example`. The app defaults to 15 OpenRouter calls/minute per process; configure shared limits if scaling replicas. No OpenAI key is needed for analysis or embeddings in this architecture. After deployment, a workspace admin must separately opt in to external AI and OpenRouter free-provider use. Do not claim live provider availability until tested with the configured accounts.
-6. Deploy and inspect the Render build, pre-deploy migration, web health, and cron logs. Render generates the API secret. The frontend reads the API host from the API web service reference and builds its HTTPS base URL.
-7. Confirm the deployed frontend origin equals the backend’s `CORS_ORIGINS`. If Render assigns a different hostname, update the API allowlist and redeploy. Confirm TLS redirects and configure shared edge rate limiting/monitoring at the public edge before inviting users.
+Use `backend/.env.example`, root `.env.example`, and the `envVars` section of `render.yaml` as the source of exact names and defaults. Examples use placeholders only. Enter real values only in ignored local `.env` files or Render's protected environment settings.
 
-Render Blueprint provisioning may not be able to resolve a `sync:false` secret from an upstream service into the cron service in every account/setup. If the retention worker fails to receive Neon/Supabase Storage secrets, enter the same values in that service’s protected environment settings and verify one successful run in cron logs. Do not paste secrets into chat or source files.
+Backend configuration includes:
 
-## Environment values
+- Runtime/database: `SECRET_KEY`, `DATABASE_URL`, `CORS_ORIGINS`, `ACCESS_TOKEN_MINUTES`.
+- Storage: `STORAGE_BACKEND`, `UPLOAD_DIR`, `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_SERVER_SIDE_ENCRYPTION`, `S3_SSE_KMS_KEY_ID`.
+- OpenRouter: `AI_PROVIDER`, `OPENROUTER_API_KEY`, `OPENROUTER_API_BASE_URL`, `OPENROUTER_TEXT_MODEL`, `OPENROUTER_VISION_MODEL`, `OPENROUTER_MAX_REQUESTS_PER_MINUTE`.
+- Gemini fallback: optional `GEMINI_API_KEY`, `GEMINI_TEXT_MODEL`, `GEMINI_VISION_MODEL`, `GEMINI_TEXT_MODEL_ALTERNATE`, `GEMINI_VISION_MODEL_ALTERNATE`.
+- Embeddings: `EMBEDDING_PROVIDER=openrouter`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS=1536`.
+- Resilience and parsing: `AI_TIMEOUT_SECONDS`, `AI_PROVIDER_MAX_RETRIES`, `AI_RETRY_BASE_SECONDS`, `AI_RETRY_MAX_SECONDS`, `AI_CIRCUIT_BREAKER_FAILURES`, `AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS`, `OCR_LANGUAGE`.
+- Retention worker: `RETENTION_INTERVAL_SECONDS` for Compose. Render cron cadence is in `render.yaml`.
 
-The Render Blueprint defines public and non-secret settings. Required secret inputs are `DATABASE_URL`, `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `OPENROUTER_API_KEY`; `GEMINI_API_KEY` is optional for the secondary provider. `SECRET_KEY` is generated by Render. The backend also supports `CORS_ORIGINS`, `ACCESS_TOKEN_MINUTES`, `OPENROUTER_API_BASE_URL`, `OPENROUTER_MAX_REQUESTS_PER_MINUTE`, the OpenRouter model settings, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `AI_TIMEOUT_SECONDS`, `AI_PROVIDER_MAX_RETRIES`, `AI_RETRY_BASE_SECONDS`, `AI_RETRY_MAX_SECONDS`, `AI_CIRCUIT_BREAKER_FAILURES`, `AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS`, and `OCR_LANGUAGE`. Set the CORS origin to the exact frontend HTTPS origin. Set secrets only in service secret settings.
+Frontend uses `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_API_HOST` as defined by the Docker build and Render configuration. These values are public and must not contain secrets. Set backend `CORS_ORIGINS` to the exact HTTPS frontend origin, not a wildcard.
 
-## Local Compose checks
+## Admin AI consent instructions
 
-1. Copy `.env.example` to `.env`, set a unique random `SECRET_KEY` and `POSTGRES_PASSWORD`, and leave `DATABASE_URL` blank for Compose to construct a local URL.
-2. Run `docker compose config`, then `docker compose up --build`.
-3. Check `http://localhost:8000/health` and `http://localhost:3000`; exercise a workspace workflow. Compose uses PostgreSQL/pgvector, API migration startup, frontend health dependency, and a separate periodic retention worker.
+Workspace consent is off by default. In Markwise, an Admin navigates to **Settings** and explicitly enables **Allow external AI analysis**, then **Allow OpenRouter free models and embeddings**. OpenRouter consent cannot be enabled until general external-AI consent is on. Both are required for OpenRouter analysis and embedding requests. Do not enable free-provider processing for confidential or personal data. If general consent is on and OpenRouter consent is off, Gemini may still be used for analysis if configured; OpenRouter embeddings will not run. Turning off a consent setting prevents subsequent requests and invalidates cached/stored OpenRouter embeddings, but cannot cancel a request already transmitted.
 
-Compose is a development stack. The root `.env.example` now matches its OpenRouter/Nemotron defaults. It does not replace production secret management, backups, shared rate limiting, external monitoring, or TLS configuration. Both the OpenRouter request budget and API rate limiter are in-process only and do not coordinate across multiple workers or instances; add edge-level limits before scaling.
+## Provision and deploy
 
-## Production release verification
+1. Verify that the connected GitHub repository and Render account are the intended ones. Review service plans and costs before provisioning. Do not commit local `.env` files or credentials.
+2. Connect the repository in Render and create/update the Blueprint from `render.yaml`.
+3. Create/select a Neon database, enable pgvector, and add the pooled TLS URL as protected `DATABASE_URL` for the backend and retention worker.
+4. Keep the Supabase bucket private. Add its endpoint, bucket, region, access key ID, and secret access key as protected backend settings. Ensure the retention worker receives these same storage settings.
+5. Add protected `OPENROUTER_API_KEY`; add `GEMINI_API_KEY` if Gemini fallback is desired. Confirm model values and retry settings in `render.yaml`. Render generates backend `SECRET_KEY`.
+6. Confirm `CORS_ORIGINS` matches the actual frontend HTTPS URL. Confirm the frontend build-time API host/URL points to the backend service URL.
+7. Before deploying schema changes, make a Neon backup/restore point and check the current Alembic revision without printing `DATABASE_URL`. The current local head is `0008_consent_generation`. Apply migrations only through the configured release process or a carefully verified local Alembic invocation. Do not treat a failed/rolled-back deployment as a migration success.
+8. Inspect Render build and pre-deploy logs, `GET /health`, HTTPS frontend response, CORS behavior, and cron execution. Confirm the cron service is attached to the intended database and private bucket.
+9. In a dedicated test workspace, verify registration/login, Admin and non-Admin permissions, workspace isolation, private uploads, PDF/DOCX import, confirmation, AI-consent gating, real provider analysis/citations when quota permits, `CANNOT VERIFY`, finding actions/history, dashboard, and retention deletion.
+10. Configure monitoring, alerting, database backups and a restore drill, plus shared ingress rate limits before opening the service to users.
 
-Only mark deployment complete after actually running each check with production services:
+Render may not resolve a `sync:false` secret from the web service into the cron service in every setup. If a cron job lacks Neon or S3 configuration, add the same value to that service's protected settings and verify its logs; never print secrets.
 
-- Confirm Render deployment succeeds, Alembic reaches head, `/health` reports database connected, frontend responds over HTTPS, and CORS accepts only the expected origin.
-- Register a dedicated test workspace, log in, verify role restrictions and cross-workspace isolation, upload a document to the private Supabase bucket, import and admin-confirm a guideline, and verify retention deletion removes both object and metadata.
-- With external AI explicitly enabled in that test workspace, verify review analysis uses real model responses and real pgvector retrieval/citations. Exercise unsupported claim `CANNOT VERIFY`; inspect source citation excerpts and verify the vision workflow with a real image/reference logo. Never substitute fabricated citations or canned results.
-- Verify dashboard values against the test workspace’s records; check HTTPS, headers, edge rate limits, logs, database backups, Supabase bucket privacy and purge outcomes. Run the frontend with keyboard and screen-reader checks.
+## Local Compose verification
 
-The current local backend suite uses SQLite and mocked AI/S3 adapters. The frontend build and Node smoke/accessibility checks are not browser end-to-end tests. The local SQLite migration check does not prove Neon/pgvector compatibility. The live Supabase Storage probe passed upload, authenticated download, anonymous denial, and post-delete absence. Docker, live AI providers, purge scheduling, production workflows and public URL checks remain unverified.
-## Connect a local backend to Neon
+From the repository root in PowerShell:
 
-For a local backend or Alembic run, put the Neon connection string in `backend/.env` at the repository path `C:\Users\niket\OneDrive\Desktop\markwise_app\backend\.env`. Copy `backend/.env.example` to that filename and replace only the `DATABASE_URL` value with the pooled connection string from Neon. Do not paste credentials into chat or commit the `.env` file. Keep `sslmode=require` (or the stronger `verify-full` if your Neon connection settings provide the required certificate verification configuration). The backend automatically uses psycopg 3 via SQLAlchemy and enforces TLS for remote PostgreSQL hosts; local Compose database URLs are unchanged. Alembic reads the same settings and uses psycopg's PgBouncer-compatible non-prepared statement mode.
+```powershell
+Copy-Item .env.example .env
+```
 
-Neon connectivity has been verified from `backend/.env`. Existing migrations through `0005_finding_decisions` have been applied. Verified all 12 application tables, `vector` extension version 0.8.6, the `vector(1536)` embedding column, cosine HNSW index, and zero Alembic drift. Backend integration tests were explicitly run against in-memory SQLite and did not touch Neon.
+Set a unique `SECRET_KEY` (at least 32 characters) and `POSTGRES_PASSWORD` in the ignored root `.env`; leave `DATABASE_URL` blank to use the Compose PostgreSQL/pgvector service. Then run:
 
+```powershell
+docker compose config
+docker compose up --build
+```
 
-## GitHub source safety status
+Check `http://localhost:8000/health` and `http://localhost:3000`. Compose is a development configuration; successful YAML parsing is not equivalent to successful service startup.
 
-Git metadata currently contains `origin/main` with one commit and a 41-file tree. A high-confidence scan found no credential patterns; database URL patterns in test fixtures were placeholders. `.gitignore` blocks `backend/.env`, other environment files, uploads, local databases/exports, key material, credentials directories, dependency folders, and generated artifacts, while retaining safe `.env.example` templates. This task did not commit or push. The remote’s visibility/ownership is unverified; review it before any further publish action.
+## Local Neon migration procedure
 
+For direct local Alembic use, copy `backend/.env.example` to the ignored `backend/.env` and enter the intended Neon pooled URL with `sslmode=require`. Verify its host/database safely without printing the URL. Back up the database, check current revision, then run from the repository root:
 
-## Supabase Storage S3 configuration
+```powershell
+python -m alembic -c backend/alembic.ini current
+python -m alembic -c backend/alembic.ini upgrade head
+python -m alembic -c backend/alembic.ini current
+```
 
-Put the actual storage settings only in the ignored `backend/.env` file. Required settings are `STORAGE_BACKEND=s3`, `S3_ENDPOINT_URL=https://<project-ref>.storage.supabase.co/storage/v1/s3`, `S3_BUCKET=markwise-assets`, `S3_REGION=<region copied from Supabase S3 settings>`, `S3_ACCESS_KEY_ID=<markwise-backend access key ID>`, `S3_SECRET_ACCESS_KEY=<paired secret access key>`, and `S3_SERVER_SIDE_ENCRYPTION=` (empty). Copy the endpoint and region from Supabase Project Settings → Storage → S3; don’t guess them. The S3 secret is never placed in examples or source files.
+The middle command modifies the configured database. Current code expects `0008_consent_generation` as Alembic head, but compare with the live revision and review migration source before applying. Migration 0007 adds OpenRouter consent and embedding-space tracking. Its downgrade drops rebuildable vectors to prevent mixing embedding spaces but preserves knowledge content. Migration 0008 adds consent-generation columns. Never run test commands while the production URL is loaded.
 
-The application’s S3 adapter sends Signature V4 requests with path-style addressing and HTTPS for Supabase. Supabase’s S3 API rejects server-side encryption request headers, so the setting must be empty and the adapter omits SSE headers for Supabase. Keep the bucket private; Supabase’s generated S3 credentials are server-only and bypass bucket RLS. There is no existing application presigned-URL generator or download route. The backend storage check uses authenticated server-side `GetObject`, does not create signed URLs, deletes its unique probe object, and verifies absence with `HeadObject`: from the repository root run `python -m backend.app.storage_check` after setting the variables.
+## Current verification and known gaps
+
+- Latest locally recorded focused admin tests: 5 backend tests passed; frontend Node suite: 14 passed; Next.js production build passed. These are local test/build results, not production workflow verification.
+- Backend tests use SQLite and mocks unless explicitly configured otherwise; they do not prove Neon-specific behavior. Tests must be directed at a test database.
+- A Supabase Storage connectivity probe was previously reported as passing upload, server-side download, anonymous denial, and cleanup. No storage probe was run in this documentation update.
+- Real OpenRouter/Gemini generation and embeddings remain quota/account dependent and are not asserted by mocked tests. The embedding attempt at knowledge confirmation does not automatically retry after failure; missing vector values can be resumed through the Admin backfill action or consent-settings backfill.
+- Docker Compose runtime, complete production workflow, retention schedule in production, shared limits, monitoring, backup restore, assistive-technology review, and public frontend URL remain unverified here.

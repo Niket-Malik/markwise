@@ -413,7 +413,7 @@ def current_user(credentials: Annotated[HTTPAuthorizationCredentials | None, Dep
         if data["exp"] < time.time():
             raise ValueError
         user = db.get(User, int(data["sub"]))
-        if not user or user.organization_id != data["org"]:
+        if not user or user.organization_id != data["org"] or user.role == "removed":
             raise ValueError
         return user
     except (ValueError, KeyError, json.JSONDecodeError):
@@ -435,6 +435,10 @@ class RegisterIn(BaseModel):
     password: str = Field(min_length=12, max_length=200)
 
 
+class OrganizationUpdateIn(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+
+
 class LoginIn(BaseModel):
     email: str
     password: str
@@ -448,6 +452,16 @@ class KnowledgeIn(BaseModel):
     severity: str = "medium"
     source: str = "Admin entry"
     passage: str = ""
+
+
+class KnowledgeUpdateIn(BaseModel):
+    kind: str = Field(pattern="^(rule|fact|glossary)$")
+    title: str = Field(min_length=2, max_length=240)
+    body: str = Field(min_length=3, max_length=12000)
+    category: str = Field(min_length=1, max_length=60)
+    severity: str = Field(pattern="^(low|medium|high|critical)$")
+    source: str = Field(min_length=1, max_length=240)
+    passage: str = Field(max_length=12000)
 
 
 class ReviewIn(BaseModel):
@@ -471,6 +485,13 @@ class TeamMemberIn(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     role: str = Field(pattern="^(creator|manager|reviewer|admin)$")
     password: str = Field(min_length=12, max_length=200)
+
+
+class TeamMemberUpdateIn(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    name: str = Field(min_length=2, max_length=160)
+    role: str = Field(pattern="^(creator|manager|reviewer|admin)$")
+    password: str | None = Field(default=None, min_length=12, max_length=200)
 
 
 class CommentIn(BaseModel):
@@ -563,7 +584,7 @@ def register(data: RegisterIn, db: Session = Depends(db_session)):
 @app.post("/api/auth/login")
 def login(data: LoginIn, db: Session = Depends(db_session)):
     user = db.scalar(select(User).where(User.email == data.email.strip().lower()))
-    if not user or not check_password(data.password, user.password_hash):
+    if not user or user.role == "removed" or not check_password(data.password, user.password_hash):
         raise HTTPException(401, "Email or password is incorrect")
     org = db.get(Organization, user.organization_id)
     return {"access_token": token_for(user), "token_type": "bearer", "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role, "organization": org.name}}
@@ -577,18 +598,78 @@ def me(user: User = Depends(current_user), db: Session = Depends(db_session)):
 
 @app.get("/api/team")
 def list_team(user: User = Depends(current_user), db: Session = Depends(db_session)):
-    members = db.scalars(select(User).where(User.organization_id == user.organization_id).order_by(User.name)).all()
+    members = db.scalars(select(User).where(User.organization_id == user.organization_id, User.role != "removed").order_by(User.name)).all()
     return [{"id": m.id, "name": m.name, "email": m.email, "role": m.role} for m in members]
 
 
 @app.post("/api/team")
 def create_team_member(data: TeamMemberIn, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
     email = data.email.strip().lower()
-    if db.scalar(select(User).where(User.email == email)):
-        raise HTTPException(409, "That email is already registered")
+    existing = db.scalar(select(User).where(User.email == email))
+    if existing:
+        if existing.role != "removed" or existing.organization_id != user.organization_id:
+            raise HTTPException(409, "That email is already registered")
+        existing.name = data.name.strip()
+        existing.role = data.role
+        existing.password_hash = hash_password(data.password)
+        audit(db, user, "team.member_readded", "user", existing.id)
+        db.commit(); db.refresh(existing)
+        return {"id": existing.id, "name": existing.name, "email": existing.email, "role": existing.role}
     member = User(organization_id=user.organization_id, email=email, name=data.name.strip(), role=data.role, password_hash=hash_password(data.password))
     db.add(member); db.flush(); audit(db, user, "team.member_created", "user", member.id); db.commit(); db.refresh(member)
     return {"id": member.id, "name": member.name, "email": member.email, "role": member.role}
+
+
+@app.patch("/api/team/{member_id}")
+def update_team_member(member_id: int, data: TeamMemberUpdateIn, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    member = db.scalar(select(User).where(
+        User.id == member_id, User.organization_id == user.organization_id, User.role != "removed"
+    ))
+    if not member:
+        raise HTTPException(404, "Team member not found")
+    email = data.email.strip().lower()
+    if db.scalar(select(User.id).where(User.email == email, User.id != member.id)):
+        raise HTTPException(409, "That email is already registered")
+    if member.role == "admin" and data.role != "admin":
+        admin_count = db.scalar(select(func.count(User.id)).where(
+            User.organization_id == user.organization_id, User.role == "admin"
+        )) or 0
+        if admin_count <= 1:
+            raise HTTPException(409, "The last workspace admin cannot be demoted")
+    member.name = data.name.strip()
+    member.email = email
+    member.role = data.role
+    if data.password:
+        member.password_hash = hash_password(data.password)
+    audit(db, user, "team.member_updated", "user", member.id)
+    db.commit(); db.refresh(member)
+    return {"id": member.id, "name": member.name, "email": member.email, "role": member.role}
+
+
+@app.delete("/api/team/{member_id}")
+def remove_team_member(member_id: int, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    member = db.scalar(select(User).where(
+        User.id == member_id, User.organization_id == user.organization_id, User.role != "removed"
+    ))
+    if not member:
+        raise HTTPException(404, "Team member not found")
+    if member.id == user.id:
+        raise HTTPException(409, "You cannot remove your own account")
+    if member.role == "admin":
+        admin_count = db.scalar(select(func.count(User.id)).where(
+            User.organization_id == user.organization_id, User.role == "admin"
+        )) or 0
+        if admin_count <= 1:
+            raise HTTPException(409, "The last workspace admin cannot be removed")
+    db.execute(update(Review).where(
+        Review.organization_id == user.organization_id, Review.assigned_to == member.id
+    ).values(assigned_to=None))
+    # Keep historical foreign keys intact while revoking login and session access.
+    member.role = "removed"
+    member.password_hash = hash_password(secrets.token_urlsafe(40))
+    audit(db, user, "team.member_removed", "user", member.id)
+    db.commit()
+    return {"id": member_id, "removed": True}
 
 
 @app.get("/api/settings/privacy")
@@ -764,6 +845,54 @@ def set_retention_settings(data: RetentionSettingsIn, user: User = Depends(roles
     return {"upload_retention_days": organization.upload_retention_days, "review_retention_days": organization.review_retention_days}
 
 
+@app.patch("/api/settings/organization")
+def update_organization(data: OrganizationUpdateIn, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    organization = db.get(Organization, user.organization_id)
+    if not organization:
+        raise HTTPException(404, "Workspace not found")
+    organization.name = data.name.strip()
+    audit(db, user, "organization.updated", "organization", organization.id)
+    db.commit()
+    return {"id": organization.id, "name": organization.name}
+
+
+@app.delete("/api/settings/organization")
+def delete_organization(user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    organization = db.get(Organization, user.organization_id)
+    if not organization:
+        raise HTTPException(404, "Workspace not found")
+    organization_id = organization.id
+    try:
+        # Remove private objects first using the existing compensated asset-deletion path.
+        assets = db.scalars(select(StoredAsset).where(
+            StoredAsset.organization_id == organization_id
+        ).order_by(StoredAsset.id)).all()
+        for asset in assets:
+            delete_stored_asset(db, asset, user)
+
+        # Delete dependent rows in foreign-key order. This is scoped to this workspace.
+        review_ids = select(Review.id).where(Review.organization_id == organization_id)
+        finding_ids = select(Finding.id).where(Finding.review_id.in_(review_ids))
+        db.execute(sql_delete(FindingDecision).where(FindingDecision.organization_id == organization_id))
+        db.execute(sql_delete(Comment).where(Comment.organization_id == organization_id))
+        db.execute(sql_delete(ReviewAssignment).where(ReviewAssignment.organization_id == organization_id))
+        db.execute(sql_delete(ReviewVersion).where(ReviewVersion.organization_id == organization_id))
+        db.execute(sql_delete(Finding).where(Finding.id.in_(finding_ids)))
+        db.execute(sql_delete(Review).where(Review.organization_id == organization_id))
+        db.execute(sql_delete(KnowledgeChunk).where(KnowledgeChunk.organization_id == organization_id))
+        db.execute(sql_delete(Knowledge).where(Knowledge.organization_id == organization_id))
+        db.execute(sql_delete(AuditEvent).where(AuditEvent.organization_id == organization_id))
+        db.execute(sql_delete(User).where(User.organization_id == organization_id))
+        db.execute(sql_delete(Organization).where(Organization.id == organization_id))
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Workspace deletion did not complete for organization %s (%s)", organization_id, type(exc).__name__)
+        raise HTTPException(503, "Workspace deletion did not complete. Remaining records are preserved for retry.") from exc
+    logger.info("Workspace %s deleted by administrator user %s", organization_id, user.id)
+    return {"id": organization_id, "deleted": True}
+
+
 @app.get("/api/knowledge")
 def list_knowledge(user: User = Depends(current_user), db: Session = Depends(db_session)):
     rows = db.scalars(select(Knowledge).where(Knowledge.organization_id == user.organization_id).order_by(Knowledge.created_at.desc())).all()
@@ -798,6 +927,47 @@ def create_knowledge(data: KnowledgeIn, user: User = Depends(roles("admin")), db
     row = Knowledge(organization_id=user.organization_id, **data.model_dump(), status="pending")
     db.add(row); db.flush(); audit(db, user, "knowledge.created", "knowledge", row.id); db.commit(); db.refresh(row)
     return serialize_knowledge(row)
+
+
+@app.patch("/api/knowledge/{item_id}")
+def update_knowledge(item_id: int, data: KnowledgeUpdateIn, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    row = db.scalar(select(Knowledge).where(
+        Knowledge.id == item_id, Knowledge.organization_id == user.organization_id
+    ))
+    if not row:
+        raise HTTPException(404, "Knowledge item not found")
+    updates = data.model_dump()
+    if any(getattr(row, key) != value for key, value in updates.items()):
+        for key, value in updates.items():
+            setattr(row, key, value.strip() if isinstance(value, str) else value)
+        row.version += 1
+        # Old chunks may describe the previous wording. Require confirmation and rebuild them on approval.
+        row.status = "pending"
+        db.execute(sql_delete(KnowledgeChunk).where(
+            KnowledgeChunk.organization_id == user.organization_id,
+            KnowledgeChunk.knowledge_id == row.id,
+        ))
+        audit(db, user, "knowledge.updated", "knowledge", row.id)
+        db.commit(); db.refresh(row)
+    return serialize_knowledge(row)
+
+
+@app.delete("/api/knowledge/{item_id}")
+def delete_knowledge(item_id: int, user: User = Depends(roles("admin")), db: Session = Depends(db_session)):
+    row = db.scalar(select(Knowledge).where(
+        Knowledge.id == item_id, Knowledge.organization_id == user.organization_id
+    ))
+    if not row:
+        raise HTTPException(404, "Knowledge item not found")
+    db.execute(sql_delete(KnowledgeChunk).where(
+        KnowledgeChunk.organization_id == user.organization_id,
+        KnowledgeChunk.knowledge_id == row.id,
+    ))
+    db.flush()
+    audit(db, user, "knowledge.deleted", "knowledge", row.id)
+    db.delete(row)
+    db.commit()
+    return {"id": item_id, "deleted": True}
 
 
 @app.post("/api/knowledge/import")
@@ -1218,10 +1388,18 @@ def create_review(data: ReviewIn, user: User = Depends(current_user), db: Sessio
 
 
 def serialize_review(r: Review):
-    active_findings = [f for f in r.findings if f.status != "stale"]
+    terminal_finding_statuses = {"stale", "accepted", "dismissed", "applied", "resolved"}
+    active_findings = [f for f in r.findings if f.status not in terminal_finding_statuses]
+    summary = analysis_summary(r.ai_status, len(active_findings))
+    # A completed analysis with findings later resolved/dismissed is not a clean analysis.
+    # Stale findings are from prior content versions and do not affect the current result.
+    if r.ai_status == "complete" and not active_findings and any(
+        f.status in {"accepted", "dismissed", "applied", "resolved"} for f in r.findings
+    ):
+        summary["clean_review"] = False
     return {"id": r.id, "title": r.title, "content": r.content, "channel": r.channel, "audience": r.audience, "goal": r.goal, "status": r.status, "ai_status": r.ai_status,
-            **analysis_summary(r.ai_status, len(active_findings)),
-            "assigned_to": r.assigned_to, "created_at": r.created_at.isoformat(), "findings": [{"id": f.id, "kind": f.kind, "excerpt": f.excerpt, "explanation": f.explanation, "severity": f.severity, "confidence": f.confidence, "citation": f.citation, "suggestion": f.suggestion, "status": f.status} for f in r.findings if f.status != "stale"]}
+            **summary,
+            "assigned_to": r.assigned_to, "created_at": r.created_at.isoformat(), "findings": [{"id": f.id, "kind": f.kind, "excerpt": f.excerpt, "explanation": f.explanation, "severity": f.severity, "confidence": f.confidence, "citation": f.citation, "suggestion": f.suggestion, "status": f.status} for f in r.findings if f.status not in terminal_finding_statuses]}
 
 
 @app.get("/api/reviews")
@@ -1386,6 +1564,8 @@ def delete_review(review_id: int, user: User = Depends(current_user), db: Sessio
     review = db.get(Review, review_id)
     if not review or review.organization_id != user.organization_id:
         raise HTTPException(404, "Review not found")
+    if review.status in {"approved", "rejected"} and user.role != "admin":
+        raise HTTPException(403, "Only a workspace admin can delete approved or rejected reviews")
     if review.creator_id != user.id and user.role not in {"admin", "manager"}:
         raise HTTPException(403, "Only the review creator or a workspace manager can delete this review")
     # Retain a minimal audit event, then remove review content, comments, decisions and snapshots.
@@ -1407,11 +1587,12 @@ def list_audit_events(user: User = Depends(roles("admin", "manager")), db: Sessi
 
 @app.post("/api/findings/{finding_id}/decision")
 def finding_decision(finding_id: int, data: dict, user: User = Depends(current_user), db: Session = Depends(db_session)):
-    finding = db.get(Finding, finding_id)
+    # Serialize decisions for a finding so concurrent requests cannot apply or dismiss it twice.
+    finding = db.scalar(select(Finding).where(Finding.id == finding_id).with_for_update())
     if not finding or finding.review.organization_id != user.organization_id:
         raise HTTPException(404, "Finding not found")
-    if finding.status == "stale":
-        raise HTTPException(409, "This finding belongs to an earlier draft version")
+    if finding.status in {"stale", "accepted", "dismissed", "applied", "resolved"}:
+        raise HTTPException(409, "This finding is no longer active")
     review = finding.review
     if review.status in {"approved", "rejected"}:
         raise HTTPException(409, "A decided review cannot receive further finding decisions")
@@ -1423,8 +1604,8 @@ def finding_decision(finding_id: int, data: dict, user: User = Depends(current_u
     if decision not in {"accepted", "edited", "dismissed"}:
         raise HTTPException(422, "Unsupported decision")
     reason = data.get("reason", "")
-    if decision in {"edited", "dismissed", "rejected"} and (not isinstance(reason, str) or len(reason.strip()) < 3):
-        raise HTTPException(422, "Add a short reason for editing, dismissing, or rejecting this finding")
+    if decision == "dismissed" and (not isinstance(reason, str) or len(reason.strip()) < 3):
+        raise HTTPException(422, "Add a short reason for dismissing this finding")
     if not isinstance(reason, str) or len(reason) > 2000:
         raise HTTPException(422, "Decision reason is limited to 2,000 characters")
     if decision == "accepted":
@@ -1450,13 +1631,6 @@ def finding_decision(finding_id: int, data: dict, user: User = Depends(current_u
         finding.status = decision
         review.content = updated_content
         db.add(ReviewVersion(organization_id=user.organization_id, review_id=review.id, user_id=user.id, content=updated_content))
-        for previous in review.findings:
-            if previous.status != "stale":
-                previous.status = "stale"
-        new_findings, review.ai_status = analyse_review_content(db, user, review.content, review.channel, review.audience, review.goal)
-        for finding_data in new_findings:
-            db.add(Finding(review_id=review.id, **finding_data))
-        review.status = review_workflow_status(review.ai_status, new_findings)
     else:
         finding.status = decision
         if decision == "edited" and isinstance(data.get("suggestion"), str):
@@ -1476,6 +1650,38 @@ def finding_decisions(finding_id: int, user: User = Depends(current_user), db: S
         FindingDecision.finding_id == finding_id,
     ).order_by(FindingDecision.created_at, FindingDecision.id)).all()
     return [{"decision": row.decision, "reason": row.reason, "author": db.get(User, row.user_id).name, "created_at": row.created_at.isoformat()} for row in rows]
+
+
+@app.get("/api/reviews/{review_id}/finding-history")
+def review_finding_history(review_id: int, user: User = Depends(current_user), db: Session = Depends(db_session)):
+    review = db.scalar(select(Review).where(
+        Review.id == review_id,
+        Review.organization_id == user.organization_id,
+    ))
+    if not review:
+        raise HTTPException(404, "Review not found")
+    rows = db.execute(
+        select(FindingDecision, Finding)
+        .join(Finding, Finding.id == FindingDecision.finding_id)
+        .where(
+            FindingDecision.organization_id == user.organization_id,
+            Finding.review_id == review_id,
+            FindingDecision.decision.in_({"accepted", "dismissed"}),
+        )
+        .order_by(FindingDecision.created_at, FindingDecision.id)
+    ).all()
+    return [{
+        "id": decision.id,
+        "finding_id": finding.id,
+        "kind": finding.kind,
+        "excerpt": finding.excerpt,
+        "explanation": finding.explanation,
+        "citation": finding.citation,
+        "status": "Applied" if decision.decision == "accepted" else "Dismissed",
+        "reason": decision.reason,
+        "timestamp": decision.created_at.isoformat(),
+        "applied_rewrite": finding.suggestion if decision.decision == "accepted" else None,
+    } for decision, finding in rows]
 
 
 @app.post("/api/uploads")

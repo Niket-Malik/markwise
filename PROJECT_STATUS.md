@@ -1,82 +1,64 @@
 # Markwise project status
 
-## Scope and current state
+## Scope and deployment state
 
-Work continues in the existing FastAPI, SQLAlchemy/Alembic, PostgreSQL/pgvector, and Next.js application. The original Round 1 proposal is the product acceptance reference; the pasted master prompt supplies the user's implementation instructions. This repository is an expanded MVP implementation, but it is not yet production deployed and several service-dependent requirements remain unverified.
+Development continues in the existing FastAPI, SQLAlchemy/Alembic, PostgreSQL/pgvector, and Next.js project. This file records implementation state separately from external-service verification.
 
-## Implemented
+Markwise is already deployed and running. For access to the live application or backend URLs, please contact the project owner. No deployed URLs are stored in the documentation. This documentation update did not contact live services; the latest production Alembic revision explicitly reported during migration troubleshooting was `0006_review_visual_assets`, and the attempted upgrade beyond it failed and rolled back. The checked-in Alembic head is `0008_consent_generation`. Confirm the actual production revision before applying pending migrations.
 
-- Workspace-scoped accounts, roles, review assignments, decisions, comments, content versions, audit events, and admin-confirmed knowledge.
-- Consent-gated AI chain: OpenRouter `nvidia/nemotron-3.5-super-vl:free` (text, vision and JSON schema) → Gemini `gemini-3.5-flash` / `gemini-3.5-flash-lite` → existing Knowledge Base fallback. HTTP 429/quota skips same-provider alternates; temporary Gemini failures can advance to its alternate. OpenAI analysis and embeddings are no longer called by the configured free stack. Embeddings use `nvidia/nemotron-3.5-embed-1b:free`, requested as 1536 dimensions to preserve the existing pgvector schema; every chunk records an embedding-space fingerprint. External AI stays workspace opt-in. Approved-source chunks can be retrieved through pgvector on PostgreSQL (lexical fallback otherwise). Provider findings must cite retrieved source IDs and exact excerpts or in-bounds image regions; unsupported claims can abstain as `CANNOT VERIFY`; suggestions retain citation and intent validation.
-- AI provider calls use bounded retries, exponential backoff with jitter and Retry-After, 429/quota/5xx/timeout/connection classification, per-process circuit cooldown and half-open recovery, capability checks for image failover, credential-free structured logs, and retryable user-facing failure status. Workspace admins must separately consent to OpenRouter free-provider data processing; disabling consent clears vectors and workspace query-cache entries. AI generation/retry is limited to 10 requests per minute per client IP, and a separate process-wide OpenRouter budget limits all upstream analysis/retries/embeddings to 15 calls per minute by default; production still needs shared limits across replicas. Provider health is exposed to authenticated workspace settings and an admin-only status route.
-- When an opted-in text review has no matching source, AI can still inspect for factual claims; validated unsupported claims are explicitly marked `CANNOT VERIFY`. The review disclosure distinguishes this from a grounded source match.
-- PDF and DOCX parsing, scanned PDF and image OCR using Tesseract, pending imported guideline passages, and source document storage.
-- Image review with optional vision provider, optional user-supplied logo reference, palette sampling, OCR-derived contrast estimates, and alt-text checks. Heuristic measurements are disclosed as estimates, not definitive accessibility certification.
-- Local or S3-compatible storage adapter; upload and review retention settings; Compose retention worker; review deletion and reasoned finding decisions. AWS S3 writes default to AES256 server-side encryption and support KMS; Cloudflare R2 and Supabase Storage omit unsupported SSE headers. Audit history is preserved through content purge.
-- File type signatures are checked before storage/OCR; DOCX decompression, upload size, pixel count, and visual-reference limits are bounded.
-- PDF/DOCX extracted text now populates the draft field so users can continue through the review workflow.
-- Applying a source-validated text suggestion replaces a unique flagged span only, saves a review version, preserves prior finding reasons, and re-runs analysis. Ambiguous repeated spans and non-rewrite/CANNOT VERIFY findings cannot be applied as edits.
-- Workspace admins can list and delete their tracked uploads from Settings; non-admins receive no upload inventory.
-- Review-submission and finding-decision authorization now enforce ownership/management or assigned-reviewer access. Stale findings are hidden from current results while their reason history remains available.
-- Dashboard data for repeated unsupported claims, finding decisions, dismissed findings, and contested rules.
-- Rate limits and basic response security headers. Docker Compose configuration includes PostgreSQL/pgvector and health dependencies.
+## Implemented in the current code
 
-## Verification completed in this workspace
+- Workspace registration, bearer-token authentication, roles (`admin`, `manager`, `reviewer`, `creator`), workspace-scoped reviews and knowledge, comments, assignments, decisions, content versions, findings, and audit events.
+- Admin-only workspace rename/delete, team member edit/removal, knowledge rule edit/delete, and deletion of approved/rejected reviews. The backend enforces roles and workspace scope. The last Admin cannot be demoted or removed. Removed members retain historical references but cannot log in.
+- PDF/DOCX guideline import and passage extraction. The source upload is stored as an asset; extracted passages enter a pending queue and require Admin confirmation.
+- OCR via Tesseract for scanned PDFs/images, DOCX parsing, upload signature/size validation, PDF text extraction, and extraction errors returned to the UI.
+- Consent-gated OpenRouter-first text/vision analysis with Gemini secondary. Current configured Gemini models are `gemini-3.5-flash` primary and `gemini-3.5-flash-lite` alternate for text and vision. Structured output, image capability checks, approved-source retrieval, citation validation, `CANNOT VERIFY`, guarded suggestions, bounded retries, quota-aware failover, circuit cooldown/recovery, and provider status are implemented.
+- Failed AI analysis is distinct from completed clean analysis. A deterministic Knowledge Base fallback uses approved workspace guidance and can return `CANNOT VERIFY`; it is not labelled an AI success. Manual AI retry is available on eligible failed/incomplete reviews; no scheduled AI retry is configured.
+- Finding Apply, Edit suggestion, and Dismiss-with-reason update persisted finding records. Apply writes a review version and resolves only the selected finding; edit updates that finding; dismiss stores its reason. Finding History is loaded from persisted decisions. These actions do not trigger full AI re-analysis or regenerate sibling findings.
+- PostgreSQL/pgvector semantic retrieval and lexical fallback. OpenRouter Nemotron Embed requests 1536 dimensions for the existing `vector(1536)` column; embedding-space metadata prevents comparison with old OpenAI vectors. Consent generation columns invalidate in-flight operations before subsequent outbound calls.
+- Guideline confirmation attempts chunk embedding synchronously when external-AI and OpenRouter consents/configuration allow it. If that request fails, the knowledge can still become active with chunks whose embeddings are null. Confirmation does not automatically retry or enqueue a durable job. Admin backfill scans missing/stale chunks in bounded batches; it can be started from the UI and is also queued when privacy settings are saved with both consents enabled. A backfill failure pauses, and can be resumed later.
+- Local/S3-compatible storage, private Supabase Storage S3 support, upload inventory/deletion for Admins, configurable review/upload retention, and Compose/Render retention worker configuration.
+- Image palette/contrast/alt-text heuristics and optional vision analysis/reference-logo comparison. These are estimates and not a formal accessibility or exact-logo certification.
+- Workspace dashboard analytics and insights based on stored review/findings/decisions/knowledge data.
+- Responsive Next.js UI, keyboard focus indicators, form labels, navigation landmarks, and skip link.
+- Custom forest-green Markwise favicon/app branding: M plus verification check, multi-resolution ICO, SVG, Apple Touch Icon, 192px/512px app icons, web manifest, and Next.js metadata in `frontend/app/layout.tsx`.
 
-- AI model/provider failover tests: prior Gemini/OpenAI configuration had 20 mocked tests; the free-stack update adds mocked OpenRouter request, vision, embedding, vector-space, quota failover, consent and cache tests. Live generation/embedding attempts and their transient service/quota failures are recorded below. No environment file values are included in this status.
-- Free-stack verification (2026-11-06): full backend suite **68 passed** using SQLite and mocked providers/storage, frontend tests **6 passed**, and Next.js production build passed. No live AI or embedding calls were made. The test runner uses local loopback access for Starlette TestClient and explicit test-only database/secret values.
-- Live provider probe (2026-11-06): Gemini model metadata access returned HTTP 200, but both text and image generation returned HTTP 503. OpenAI text, image, and embedding requests returned HTTP 429 classified from whitelisted error fields as quota exhaustion. Simulated Gemini transient failure correctly routed a live request to OpenAI, which was also blocked by quota. No live analysis or embedding vector was produced; no credentials or response bodies were printed. Both keys are configured in backend/.env (presence only checked).
-- Quota-safe verification (2026-11-06): resolved local model settings match both requested primary/alternate orders; all four IDs pass the application's model/capability allowlists. Gemini/OpenAI keys are present (presence only); OpenAI embeddings remain `text-embedding-3-small` and the metadata column remains `vector(1536)`. No live requests were made in this verification because the prior probe found Gemini generation 503 and OpenAI quota exhaustion 429.
-- Quota-safe final verification (2026-11-06): **20 model/failover tests passed** and the complete backend suite passed **39 tests** with SQLite, provider disabled in the test process, and mocked provider/storage calls. Zero live API requests were made. Model capability allowlists passed for all four models, and `vector(1536)` metadata plus OpenAI `text-embedding-3-small` were confirmed without a database connection.
+## Known limitations and partial work
 
-- Earlier backend integration baseline: **18 passed** using in-memory SQLite and mocked AI/storage; the current full suite has since passed 35 tests and did not connect to or modify Neon.
-- Frontend production build and four Node-based production artifact smoke/accessibility checks passed. These are not interactive browser end-to-end tests.
-- Python compile passed. SQLite Alembic upgrade and drift checks passed on an isolated temporary database.
-- Neon connection was verified from `backend/.env` using SQLAlchemy 2.0.40, psycopg 3.2.6, and TLS (`sslmode=require`); psycopg/libpq confirmed the active client socket is encrypted. A read-only `SELECT 1` succeeded.
-- All five checked-in Alembic migrations (`0001_initial` through `0005_finding_decisions`) were applied to the initially empty Neon public schema. Verified all 12 expected application tables, Alembic revision `0005_finding_decisions`, pgvector extension 0.8.6, `knowledge_chunks.embedding` type `vector(1536)`, and the cosine HNSW index. Alembic `check` reports no new upgrade operations after aligning SQLAlchemy metadata with the existing HNSW index.
-- Render and Compose YAML parsed. Docker/Compose is unavailable, so containers were not started.
-- Browser keyboard inspection is not a full cross-browser or WCAG audit.
+- Live AI generation, image analysis, and embedding availability depend on provider account credentials, model availability, and quota. Mocked tests do not establish live provider health. OpenRouter free inputs may be logged or used to improve provider products; Admin consent is required and should not be enabled for confidential/personal data.
+- OpenRouter embedding generation during confirmation is a single bounded HTTP request path with no automatic retry. Failed chunks remain detectable by null vector metadata; recovery is manual/controlled, not a durable task queue.
+- Existing vectors from another embedding space need re-indexing under the current consented model before semantic retrieval can use them. Lexical retrieval remains available.
+- Rate limiting and OpenRouter request budgets are in-process, not shared across workers or instances. Production needs edge/shared limits.
+- Tesseract/visual heuristics need more deployment-image and assistive-technology evaluation. UI unit/smoke tests are not full browser E2E or screen-reader certification.
+- Workspace deletion removes S3 objects before deleting related DB records. If storage deletion fails partway, database rows remain for retry, but objects already removed earlier in the loop cannot be restored automatically.
+- Invitations, password recovery, SSO, secure refresh-cookie flow, slide-deck/CMS integrations, multilingual/on-prem providers, monitoring/alerting, and a backup-restore drill are not implemented or verified.
 
-## Current migration note
+## Verification record
 
-- Added forward Alembic migration `0007_openrouter_embedding_space` after production-known revision 0006. It adds an admin opt-in boolean (default false) and nullable embedding-space tag. Existing `vector(1536)` values are retained but not used until re-embedded under the new fingerprint. Migration SQL generation is verified locally only; do not infer that production Neon has applied 0007.
+Latest locally recorded focused verification (2026-11-07):
 
-## Outstanding mandatory work / external blockers
+- Backend Admin management tests: **5 passed** on a local isolated test database; no Neon/production database was contacted.
+- Frontend Node tests: **14 passed**.
+- Next.js production build: **passed**.
+- `git diff --check`: **passed** with Git line-ending conversion warnings only.
 
-- OpenRouter/Gemini model calls and the free embedding endpoint remain unverified live; all current provider checks are mocked. OpenRouter free endpoint uptime/quotas may fluctuate. Supabase Storage probe passed previously. The Supabase Storage probe has been run against the configured private bucket and verified upload, download, anonymous denial, and post-delete absence.
-- OCR depends on Tesseract; actual scanned document OCR needs verification in the deployment image or configured host.
-- Automated frontend checks are build-artifact checks, not interactive browser workflows or full assistive-technology review.
-- Security review remains incomplete: process-local rate limiting needs a shared edge limit in production; verify session lifecycle, proxy trust, storage retention, backups, logging, and operational monitoring.
-- Docker Compose startup cannot be verified because Docker/Compose is unavailable in the environment.
-- No public host, deployment authorization, HTTPS monitoring, or verified live URL is available; Supabase Storage is configured and its probe passed.
+These checks were recorded before this documentation-only update. The complete backend suite was not rerun for the documentation changes. Earlier test counts in prior working notes conflicted; those historical counts are intentionally not used as the current suite result.
 
-See [TODO.md](TODO.md), [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md), and [DEPLOYMENT.md](DEPLOYMENT.md). Do not treat mocked or SQLite-only tests as live-service verification.
+Other prior verification reported by the project history (not repeated during this task): a Supabase private-bucket probe passed temporary upload, server-side download, anonymous denial, and cleanup; Neon connection and pgvector schema were previously verified. Do not infer that a production migration has been applied from those earlier checks. Current production database state was not accessed.
 
+## Migrations
 
-## Deployment preparation (not a live deployment)
+- Current local Alembic chain: `0001_initial` → `0002_ai_retrieval` → `0003_asset_storage_retention` → `0004_review_retention` → `0005_finding_decisions` → `0006_review_visual_assets` → `0007_openrouter_embedding_space` → `0008_consent_generation`.
+- Migration 0007 tracks OpenRouter consent and embedding-space identity. Its downgrade clears rebuildable vectors before removing their space metadata; source text and knowledge records remain.
+- Migration 0008 adds separate general external-AI and OpenRouter consent generation columns.
+- Latest production revision explicitly reported in prior user troubleshooting was 0006, and an upgrade beyond it failed/rolled back. Production revision must be checked read-only before any migration; this task did not contact or modify Neon.
 
-- Added `render.yaml` for Render API/frontend Docker services, pre-deploy Alembic migration, HTTPS health endpoint, and daily retention cron; frontend resolves its API host from Render service metadata.
-- Neon URL normalization, TLS enforcement for remote PostgreSQL, pooler-safe psycopg settings, and Supabase Storage S3 configuration are implemented; live Supabase connectivity and private-bucket lifecycle probe passed.
-- No public service was deployed. Render authorization and Docker CLI are unavailable. The Git remote exists, but its visibility is unknown. No live URLs or managed-service checks are claimed.
+## Remaining release work
 
-## Neon integration (verified)
+- Confirm production Alembic revision and apply reviewed pending migrations through the release procedure with a backup.
+- Verify Render frontend availability, health, CORS, migrations, cron configuration, and critical workflows against production without publishing deployed URLs in repository documentation.
+- Perform quota-safe live text/vision/embedding checks when provider capacity is available and explicitly authorized.
+- Verify Compose runtime, production retention purge, monitoring/alerting, shared rate limiting, backup restore, responsive behavior, and assistive-technology workflows.
+- Complete full backend suite and interactive end-to-end/security testing before a production-readiness claim.
 
-- Local backend settings and Alembic read `backend/.env`; root `.env` and Compose configuration remain unchanged. The user-provided database URL was not printed or copied into documentation.
-- Read-only Neon connectivity and schema checks succeeded. Existing Alembic revisions through `0005_finding_decisions` were applied; all required tables and pgvector schema/index were verified. `alembic check` reports no drift.
-- Backend tests were forced to in-memory SQLite and do not touch Neon data.
-
-
-## GitHub push preparation
-
-- Git branch `main` has an `origin/main` upstream and one reachable commit; this task did not create a commit or push. The remote visibility/ownership remains unverified.
-- The current `origin/main` tree has 41 files. A secret-pattern scan of that history found no high-confidence credential patterns; five database-URL matches were test placeholders only. Current uncommitted Supabase storage changes remain in the working tree. All matched values were suppressed.
-- `.gitignore` excludes environment files (while allowing `.env.example` templates), uploads, local databases/backups, credentials/key material, developer environments, and generated build/test output.
-- No commit or push was made during this storage task. The existing remote’s visibility/ownership is not verified; do not publish more changes without explicit approval.
-
-
-## Supabase Storage integration (live probe verified)
-
-- Supabase Storage S3 is configured in code with Signature V4, path-style requests, HTTPS-only endpoint validation, and no SSE headers. Added server-side `get_object` and a temporary connectivity probe covering upload, download, anonymous public-access denial, and cleanup.
-- `backend/.env` remains private and was not modified by this task. Configuration presence was checked without printing values.
-- Backend tests: **18 passed** using in-memory SQLite and mocked S3; compileall and Render/Compose YAML parsing passed. The live Supabase probe passed upload, authenticated download, anonymous access denial, and HeadObject confirmation that the temporary key was absent after deletion.
-- The existing app had no presigned URL generator or object download route. The new probe uses private server-side S3 GetObject and creates no signed/public URL.
+See [README.md](README.md) for setup and user workflows, [TODO.md](TODO.md) for remaining work, [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md) for acceptance tracking, and [DEPLOYMENT.md](DEPLOYMENT.md) for release procedure.

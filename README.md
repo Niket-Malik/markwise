@@ -1,37 +1,100 @@
 # Markwise
 
-**Pre-publication brand governance that explains, cites, and suggests while leaving the decision to people.**
+**Pre-publication brand governance that explains, cites, and suggests while leaving decisions to people.**
 
-Markwise helps teams catch brand and factual issues before publication. Brand rules and approved facts often live in documents that are easy to overlook, while many people and tools produce content quickly. Markwise checks drafts against a workspace's confirmed guidance, explains findings with source references, and offers guarded suggestions. People make every final decision; Markwise does not publish content.
+Markwise helps teams check draft text and images against confirmed brand guidance and approved facts before publication. It surfaces evidence-backed findings, abstains with `CANNOT VERIFY` when support is missing, and lets people decide how to handle findings. Markwise does not publish content.
 
-## Features implemented
+## Features
 
-- Workspace registration, login, team roles, review assignments, comments, decisions, review versions, and audit events.
-- Admin-confirmed knowledge entries from manually entered rules/facts and imported PDF or DOCX guidelines. Imported passages stay pending until an admin confirms them.
-- Deterministic restricted-term and percentage-claim checks, plus AI-assisted tone, claim, and image analysis when configured and enabled for that workspace.
-- PostgreSQL/pgvector embeddings and workspace-scoped retrieval over approved sources. Findings are validated against those sources; unsupported claims can return `CANNOT VERIFY` rather than an invented fact or citation.
-- Guarded, intent-aware suggestions. A suggestion can be edited, accepted, or dismissed with a reason; applying it creates a review version. The original draft is not silently replaced.
-- PDF text extraction, scanned PDF/image OCR (Tesseract; English is installed in the Docker image), and DOCX guideline parsing.
-- Image review for palette checks, OCR-derived contrast estimates, alt-text checks, and optional vision analysis. A reference logo can be supplied for comparison. Visual measurements are heuristics and are not a formal accessibility certification or pixel-perfect logo verification.
-- Local or S3-compatible upload storage, upload inventory/deletion for admins, per-workspace review and upload retention settings, and an automatic retention job.
-- Workspace-scoped dashboard data for recurring finding types, dismissed findings, contested cited rules, and unsupported-claim guidance gaps.
-- Responsive Next.js interface, keyboard focus styles, labelled forms, navigation landmarks, and a skip link.
+- Workspace registration and bearer-token login; workspace-scoped accounts, reviews, knowledge, dashboard data, and audit events.
+- Admin-confirmed knowledge entries from manual rules/facts or PDF/DOCX guideline imports. Imported passages remain pending until an Admin confirms each passage.
+- PDF text extraction, scanned PDF/image OCR using Tesseract, and DOCX guideline parsing. Imported originals are retained as private tracked uploads when storage is configured.
+- AI-assisted text and visual review, approved-source retrieval, citation validation, `CANNOT VERIFY` outcomes, and guarded contextual rewrite suggestions.
+- Deterministic fallback checks against approved knowledge when external AI is unavailable. This is labelled as a Knowledge Base fallback and is not represented as a completed AI review.
+- Per-finding Apply, Edit suggestion, and Dismiss-with-reason actions. Decisions, content versions, and finding history are persisted; one finding action does not regenerate sibling findings or trigger a complete AI re-analysis.
+- Image checks for palette, OCR-derived contrast estimates, alt text, and optional vision analysis. A user-supplied reference logo can be compared. Visual checks are heuristics, not formal accessibility certification or pixel-perfect identity verification.
+- Workspace and team administration, role-based review assignments/decisions, comments, retention controls, and audit history.
+- Admin-only workspace edit/delete; team member edit/remove; knowledge rule edit/delete; and deletion of approved/rejected reviews.
+- Local or S3-compatible object storage, including Supabase Storage S3; an automated retention worker is configured for Compose and Render.
+- Real-data workspace dashboard insights for review counts, recurring findings, dismissed/overridden findings, contested cited rules, and guidance gaps.
+- Responsive Next.js UI with keyboard focus styling, labelled forms, navigation landmarks, and a skip link.
+- Custom forest-green Markwise branding, including a browser favicon, Apple Touch Icon, app shortcut icons, and web app manifest.
 
-The Round 1 proposal also describes broader future workflows such as slide-deck review, integrations, SSO, and automatic routing to named reviewers. Those are not represented here as implemented features. See [PROJECT_STATUS.md](PROJECT_STATUS.md), [TODO.md](TODO.md), and [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md) for the current verified scope.
+The original proposal also describes future ideas such as SSO, slide-deck review, CMS integrations, invitations, and multilingual/on-prem workflows. These are not claimed as implemented. See [PROJECT_STATUS.md](PROJECT_STATUS.md), [TODO.md](TODO.md), and [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md).
 
-## Architecture and technology
+## Architecture and technology stack
 
 | Layer | Implementation |
 | --- | --- |
 | Frontend | Next.js 16, React 19, TypeScript, CSS |
 | API | Python 3.12, FastAPI, Pydantic Settings |
-| Persistence | SQLAlchemy 2, Alembic, PostgreSQL, pgvector; SQLite is used for local exploration and automated backend tests |
-| Documents and images | pypdf, python-docx, pypdfium2, Tesseract OCR, Pillow |
-| AI | OpenRouter free NVIDIA Nemotron Super VL for consented text/vision analysis; Gemini secondary; OpenRouter NVIDIA Nemotron Embed with a separately tagged 1536-D vector space |
-| File storage | Local filesystem or S3-compatible storage (including Supabase Storage S3) |
-| Runtime | Docker Compose for local services; Render Blueprint for prepared deployment |
+| Persistence | SQLAlchemy 2, Alembic, PostgreSQL with pgvector; SQLite for isolated local tests |
+| Document/image processing | pypdf, python-docx, pypdfium2, Tesseract OCR, Pillow |
+| AI analysis | OpenRouter Nemotron Super VL primary; Gemini Flash secondary when configured and consented |
+| Embeddings | OpenRouter Nemotron Embed, 1536-dimensional vectors in PostgreSQL `vector(1536)` |
+| Object storage | Local filesystem or S3-compatible storage (Supabase Storage S3 supported) |
+| Deployment | Docker Compose for local services; Render Blueprint for prepared deployment |
 
-The API owns authentication, authorization, workspace scoping, review workflows, retrieval, provider orchestration, and storage access. The browser calls the API with a bearer token. Database migrations are in `backend/migrations/versions`; the API runs them at Compose startup and Render runs them in its pre-deploy phase.
+FastAPI owns authentication, authorization, workspace scoping, reviews, retrieval, provider orchestration, and storage access. The browser calls the API using a bearer token. Alembic migrations live in `backend/migrations/versions`; Compose applies them before starting the API and Render is configured with a pre-deploy migration command.
+
+## AI providers and model configuration
+
+- **Text/vision primary:** OpenRouter `nvidia/nemotron-3.5-super-vl:free`, via the OpenAI-compatible Chat Completions endpoint with structured JSON output and image input.
+- **Text/vision fallback:** Google Gemini Interactions API. Primary model `gemini-3.5-flash`; alternate `gemini-3.5-flash-lite` for text and vision.
+- **Embeddings:** OpenRouter `nvidia/nemotron-3.5-embed-1b:free`. Markwise requests 1536 dimensions and validates the output before storing it.
+- Model IDs and retry/circuit settings are configurable with `OPENROUTER_*`, `GEMINI_*`, `EMBEDDING_*`, and `AI_*` variables. See [backend/.env.example](backend/.env.example) and [render.yaml](render.yaml); examples contain placeholders, never real secrets.
+
+When both AI providers are configured and the workspace has enabled both required permissions, provider order is OpenRouter then Gemini. Provider calls use bounded retries for retryable failures, quota-aware model/provider failover, circuit cooldown, and recovery. Vision fallback is restricted to models marked vision-capable. Failed analysis remains incomplete; it is not shown as a clean AI review. Live provider availability and quota depend on the configured accounts and may change.
+
+The backend retains a legacy OpenAI-compatible adapter for installations that configure `AI_PROVIDER=openai` or `openai_compatible` and `AI_API_KEY` while neither OpenRouter nor Gemini is configured. That compatibility path still requires general external-AI consent. It is not used by the default OpenRouter/Gemini configuration, and OpenAI embeddings are not used.
+
+### Important: Enable AI Review Permissions
+
+An Admin must explicitly enable workspace consent before external AI processing. The settings are **disabled by default**.
+
+In Markwise, open **Settings** and enable:
+
+1. **Allow external AI analysis** — permits consented review content to be sent to an external AI provider.
+2. **Allow OpenRouter free models and embeddings** — separately permits OpenRouter free models and OpenRouter embeddings. The first permission must already be enabled before this setting can be turned on.
+
+Both permissions are required for the OpenRouter-based AI review and embedding workflow. If general external-AI consent is off, no external AI analysis should run. If OpenRouter-specific consent is off, OpenRouter analysis and embeddings are unavailable; configured Gemini may still be used for analysis when general consent is on, but Gemini does not replace the OpenRouter embedding workflow. If no eligible provider is configured and consented, AI analysis is unavailable and the app uses its clearly labelled Knowledge Base fallback where possible.
+
+OpenRouter free-provider inputs may be logged and used to improve provider products. **Do not enable these permissions for confidential or personal data.** Review provider terms and your organisation's data policy before opting in. Consent withdrawal prevents later requests and clears stored OpenRouter embeddings/cache; a request already sent to an external provider cannot be cancelled.
+
+## Knowledge Base, guideline import, and embeddings
+
+Admins can add rules/facts manually or import PDF/DOCX through **Knowledge base → Admin tool → Import a guideline**. Extraction creates candidate passages and stores the source file; candidates are pending and do not influence review until an Admin confirms them. Scanned PDFs/images use the Tesseract OCR path. The original file is a tracked private object and extracted text/passages are database records.
+
+On confirmation, Markwise creates searchable chunks and attempts an OpenRouter embedding request immediately, provided both external-AI and OpenRouter consent are enabled and embedding configuration is valid. Successful 1536-dimensional vectors are saved to the chunk's pgvector column. If provider configuration, quota, rate limits, or network access prevent the request, the knowledge is still activated and chunks remain with null embedding values for lexical retrieval. This confirmation path does not enqueue an automatic retry. Admins can use **Settings → Resume missing source embeddings** to request a bounded, resumable backfill. Enabling/saving privacy settings with both consents enabled can also schedule a backfill. Backfill provider failures pause the pass; they do not create an uncontrolled retry loop.
+
+Migration 0007 tags each vector with an embedding-space fingerprint so old OpenAI embeddings are not compared against Nemotron vectors. The PostgreSQL vector dimension remains `1536`; migration 0008 adds workspace consent-generation fields. Migration commands should be run only against the intended database after taking a backup; see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+Approved-source retrieval uses workspace-scoped pgvector cosine search when compatible vectors exist and lexical retrieval as a fallback. Citations must refer to approved knowledge and validated excerpts. When evidence cannot support a factual claim, Markwise uses `CANNOT VERIFY`; it does not invent a citation. The deterministic Knowledge Base fallback is a separate, incomplete review mode and an empty fallback result is not proof of compliance.
+
+## Review and finding workflow
+
+Submitting a text or image review persists the submitted content and analysis state. The review uses approved workspace knowledge for retrieval and AI analysis only when consent and a capable provider are available. If AI analysis fails, the review remains incomplete and the app presents Knowledge Base fallback findings/abstentions with an **AI Analysis Unavailable** status. A user may select **Retry AI Analysis**; retries are manual after the initial submission and use the configured bounded provider failover.
+
+Each active finding may offer a contextual rewrite where a safe rewrite is available. **Apply suggestion** updates the applicable draft span, writes a content version and finding decision, and resolves only that finding. **Edit suggestion** persists the edited suggestion on the existing finding. **Dismiss with reason** persists a required reason and terminal decision. None of these actions launches a full AI re-analysis or recreates sibling findings. **Finding History** loads persisted applied/dismissed decisions and associated audit/decision data after refresh. A generated rewrite does not itself resolve a `CANNOT VERIFY` finding.
+
+## Roles and admin-only management
+
+The application role value `creator` is the content creator/member role.
+
+| Role | Current capabilities |
+| --- | --- |
+| Admin | Workspace-wide administration, member and role management, knowledge import/confirmation/edit/delete, privacy/provider and retention settings, upload management, review assignment/decisions, audit access, and workspace edit/delete. Admins can delete approved/rejected reviews. Last Admin cannot be demoted or removed. |
+| Manager | Workspace review management, assignment, review decisions, and audit access. Cannot perform Admin-only workspace/team/knowledge/settings operations. |
+| Reviewer | Can decide reviews assigned to them and participate in permitted review/finding workflows. Cannot use Admin-only management operations. |
+| Member (`creator`) | Can create and work with own reviews and participate in workspace review/comment workflows allowed by the API. Cannot use Admin-only management operations. |
+
+Backend endpoints enforce roles and workspace IDs; UI visibility alone is not the access control. Cross-workspace records are not available to another workspace. Admin-only actions include workspace edit/delete, team edit/remove, knowledge rule edit/delete, and approved/rejected review deletion. Review deletion removes its associated findings, decisions, comments, assignments, and versions while retaining the audit event. Workspace deletion is destructive and removes workspace-associated application data and stored assets.
+
+## Database and storage
+
+Neon PostgreSQL is supported through SQLAlchemy/psycopg 3 with TLS; pgvector stores `vector(1536)` embeddings. Alembic owns schema changes. Local development and automated tests can use SQLite, but SQLite checks do not establish PostgreSQL compatibility.
+
+The storage adapter supports local files and private S3-compatible buckets. Supabase S3 uses the project endpoint, region, private bucket, and server-only S3 access keys. Supabase S3 does not accept the AWS server-side-encryption request header, so the example leaves that setting blank. There is no public/presigned download URL flow; object reads are server-side. Review/upload retention is controlled per workspace; `0` means no automatic expiry. Compose runs a periodic retention worker and Render has a daily cron service in its Blueprint.
 
 ## Project structure
 
@@ -39,38 +102,54 @@ The API owns authentication, authorization, workspace scoping, review workflows,
 markwise_app/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py                 # API, models, auth, review and dashboard routes
-│   │   ├── ai.py                   # OpenRouter/Gemini adapters, bounded retries and failover
-│   │   ├── retrieval.py            # Approved-source retrieval
-│   │   ├── document_processing.py  # PDF, OCR and DOCX parsing
-│   │   ├── visual_analysis.py      # Local image and accessibility heuristics
-│   │   ├── storage.py              # Local/S3 object storage
-│   │   ├── retention.py            # Scheduled purge entry point
-│   │   └── storage_check.py        # Live S3 upload/download/privacy probe
+│   │   ├── main.py           # FastAPI app, SQLAlchemy models and API routes
+│   │   ├── ai.py             # OpenRouter/Gemini adapters, embeddings and failover
+│   │   ├── retrieval.py      # Approved-source semantic/lexical retrieval
+│   │   ├── document_processing.py # PDF/OCR/DOCX parsing
+│   │   ├── visual_analysis.py # Image heuristics and vision preparation
+│   │   ├── storage.py        # Local/S3 storage adapter
+│   │   ├── storage_check.py  # Opt-in S3 connectivity probe
+│   │   └── retention.py      # Retention purge entry point
 │   ├── migrations/
 │   │   ├── env.py
-│   │   └── versions/                # Alembic schema migrations
+│   │   └── versions/         # Alembic migrations 0001–0008
 │   ├── tests/
-│   │   ├── test_api.py              # API, workflow, storage and security checks
-│   │   └── test_ai_failover.py      # Mocked provider failover tests
-│   ├── .env.example               # Backend-only configuration template
-│   ├── .dockerignore
+│   │   ├── test_api.py
+│   │   ├── test_admin_management.py
+│   │   ├── test_ai_failover.py
+│   │   ├── test_finding_suggestions.py
+│   │   └── test_openrouter_migrations.py
+│   ├── .env.example          # Backend environment template (placeholders only)
 │   ├── alembic.ini
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── requirements-dev.txt
 ├── frontend/
-│   ├── app/                        # Next.js page, layout and styles
-│   ├── tests/ui-smoke.test.mjs     # Built-UI smoke/accessibility checks
+│   ├── app/
+│   │   ├── page.tsx          # Main application UI and workflows
+│   │   ├── finding-actions.mjs
+│   │   ├── review-status.mjs
+│   │   ├── layout.tsx
+│   │   └── styles.css
+│   ├── public/
+│   │   ├── favicon.ico
+│   │   ├── icon.svg
+│   │   ├── apple-touch-icon.png
+│   │   ├── icon-192.png
+│   │   ├── icon-512.png
+│   │   └── site.webmanifest
+│   ├── tests/
+│   │   ├── admin-management.test.mjs
+│   │   ├── finding-actions.test.mjs
+│   │   └── ui-smoke.test.mjs
 │   ├── Dockerfile
-│   ├── .dockerignore
 │   ├── package.json
 │   └── package-lock.json
-├── .env.example                   # Docker Compose template
-├── .github/workflows/ci.yml       # GitHub Actions checks
+├── .github/workflows/ci.yml  # CI checks
 ├── .gitignore
-├── docker-compose.yml             # pgvector, API, web and retention worker
-├── render.yaml                    # Render API, web and scheduled worker blueprint
+├── .env.example              # Docker Compose environment template
+├── docker-compose.yml        # pgvector, API, web and retention worker
+├── render.yaml               # Render web services and retention cron blueprint
 ├── DEPLOYMENT.md
 ├── IMPLEMENTATION_CHECKLIST.md
 ├── PROJECT_STATUS.md
@@ -78,17 +157,27 @@ markwise_app/
 └── README.md
 ```
 
-Local `.env` files, uploaded content, local databases, dependency directories, and generated build/test output are intentionally omitted from this tree and excluded by `.gitignore`. The original proposal PDF was available for this audit but is not checked into the project.
+## Markwise browser and app branding
 
-## Prerequisites
+The custom icon follows the existing forest-green palette and pairs an **M** monogram with a verification check. It is original Markwise artwork, designed to remain recognizable at small browser-tab sizes.
 
-- Docker Desktop or Docker Engine with the Compose plugin for the all-in-one local setup.
-- Node.js 22 and npm for frontend development outside Docker.
-- Python 3.12 for backend development outside Docker.
-- Tesseract OCR for local scanned-document/image OCR. The backend Docker image installs Tesseract with English data.
-- Optional service accounts and credentials for Neon PostgreSQL, Supabase Storage S3, OpenRouter, and Gemini. Live AI analysis requires working provider accounts, enabled models, and available quota.
+- `frontend/public/icon.svg` is the scalable SVG favicon.
+- `frontend/public/favicon.ico` contains 16px, 32px, and 48px variants for browser tabs and bookmarks.
+- `frontend/public/apple-touch-icon.png` is the 180×180 Apple Touch Icon.
+- `frontend/public/icon-192.png` and `frontend/public/icon-512.png` are app shortcut icons referenced by `frontend/public/site.webmanifest`.
+- `frontend/app/layout.tsx` declares the Next.js metadata title **“Markwise – Intelligent Brand Governance Platform”**, favicon/icon links, manifest, and Apple web-app metadata.
 
-## Local development with Docker Compose
+These assets support browser tabs and bookmarks, plus supported mobile browser shortcuts and home-screen installation. The frontend Docker build copies `public/` into the production image, so a Render rebuild/deploy serves the same assets. Browser and operating-system caching can delay icon changes after a deployment.
+
+Local environment files, uploads, database files, dependency directories, and generated build/test output are excluded from the tree and should remain untracked. No screenshots are checked into the repository.
+
+## Prerequisites and local setup
+
+- Docker Desktop/Engine with Compose, or Python 3.12 and Node.js 22 with npm.
+- Tesseract OCR when running the backend directly on a host. The backend Docker image installs Tesseract.
+- Optional accounts/credentials for Neon, Supabase S3, OpenRouter, and Gemini. Real AI calls require enabled models and available account quota.
+
+### Docker Compose
 
 From the repository root in PowerShell:
 
@@ -96,36 +185,33 @@ From the repository root in PowerShell:
 Copy-Item .env.example .env
 ```
 
-Edit the root `.env`: set a unique random `SECRET_KEY` (at least 32 characters) and `POSTGRES_PASSWORD`. Keep `DATABASE_URL` blank so Compose uses its local PostgreSQL/pgvector service. AI and S3 settings can remain unconfigured for local deterministic review and local file storage; set provider credentials only if you want external AI and S3-backed files. Never commit `.env`.
-
-Start the stack:
+Set a unique `SECRET_KEY` (at least 32 characters) and `POSTGRES_PASSWORD` in the ignored root `.env`; leave `DATABASE_URL` blank for the local pgvector service. Configure AI/S3 only when needed. Then run:
 
 ```powershell
 docker compose config
 docker compose up --build
 ```
 
-Open the frontend at [http://localhost:3000](http://localhost:3000), the API health endpoint at [http://localhost:8000/health](http://localhost:8000/health), and the FastAPI docs at [http://localhost:8000/docs](http://localhost:8000/docs). Register to create a workspace; that account is its first admin. Compose waits for PostgreSQL health, applies Alembic migrations before starting the API, then starts the frontend and a separate periodic retention worker.
+Open `http://localhost:3000`, API health at `http://localhost:8000/health`, and FastAPI docs at `http://localhost:8000/docs`. The first registered account is workspace Admin. Compose applies migrations before API startup and runs the retention loop as a separate service.
 
-The root `.env` configures Compose. For a backend or Alembic process run directly on the host, settings are read from `backend/.env`; see [Configuration](#configuration) below.
+### Backend and frontend separately
 
-## Run backend and frontend without Docker
-
-Create and activate a Python virtual environment from the repository root, then install backend dependencies:
+From the repository root:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r backend/requirements.txt
+Copy-Item backend/.env.example backend/.env
 ```
 
-Set `DATABASE_URL` and a unique `SECRET_KEY` of at least 32 characters in `backend/.env`. For SQLite exploration, a local value is `sqlite:///./markwise.db`; for Neon use the PostgreSQL setup below. Start the API from the repository root:
+Set `DATABASE_URL` and a strong unique `SECRET_KEY` in the ignored `backend/.env`. For local SQLite exploration, `DATABASE_URL=sqlite:///./markwise.db`; remote PostgreSQL requires TLS. Start the API from the repository root:
 
 ```powershell
 python -m uvicorn app.main:app --reload --app-dir backend --port 8000
 ```
 
-For the frontend, in another terminal:
+In a second terminal:
 
 ```powershell
 cd frontend
@@ -134,84 +220,52 @@ $env:NEXT_PUBLIC_API_URL = "http://localhost:8000"
 npm run dev
 ```
 
-Then open [http://localhost:3000](http://localhost:3000). Keep the API origin in `NEXT_PUBLIC_API_URL` aligned with the backend `CORS_ORIGINS` allowlist.
+The frontend API origin must be allowed by backend `CORS_ORIGINS`.
 
-## Configuration and secrets
+## Environment configuration
 
-- Root `.env.example` is the Docker Compose template; copy it to the ignored root `.env` for Compose.
-- `backend/.env.example` is the template for direct backend/Alembic use; copy it to the ignored `backend/.env`.
-- Both templates use placeholders. Enter actual secrets only in the ignored environment file or a deployment provider's protected secret settings. Do not put secrets in the frontend environment, source, issue tracker, or chat.
-- `SECRET_KEY` must be a unique random value of at least 32 characters. `CORS_ORIGINS` is a comma-separated list of exact allowed origins. `NEXT_PUBLIC_API_URL` is public and is compiled into the frontend build.
-- Other settings include token expiry, upload directory, OCR language, AI timeout/retry/circuit values, storage backend, and retention interval. See the two example files for exact variable names and defaults.
+Use the root `.env.example` for Docker Compose or `backend/.env.example` for direct backend/Alembic runs. These templates use placeholders only. Keep actual secrets in ignored `.env` files or protected Render environment settings; do not put credentials in frontend variables, docs, source, Git, or chat.
 
-## Neon PostgreSQL and migrations
+Important backend settings include `DATABASE_URL`, `SECRET_KEY`, `CORS_ORIGINS`, `STORAGE_BACKEND`, `UPLOAD_DIR`, `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `AI_PROVIDER`, `OPENROUTER_API_KEY`, `OPENROUTER_API_BASE_URL`, `OPENROUTER_TEXT_MODEL`, `OPENROUTER_VISION_MODEL`, `OPENROUTER_MAX_REQUESTS_PER_MINUTE`, `GEMINI_API_KEY`, `GEMINI_TEXT_MODEL`, `GEMINI_VISION_MODEL`, `GEMINI_TEXT_MODEL_ALTERNATE`, `GEMINI_VISION_MODEL_ALTERNATE`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `AI_TIMEOUT_SECONDS`, `AI_PROVIDER_MAX_RETRIES`, `AI_RETRY_BASE_SECONDS`, `AI_RETRY_MAX_SECONDS`, `AI_CIRCUIT_BREAKER_FAILURES`, `AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS`, `ACCESS_TOKEN_MINUTES`, `OCR_LANGUAGE`, and `RETENTION_INTERVAL_SECONDS`. Optional legacy OpenAI-compatible settings are `AI_API_BASE_URL`, `AI_API_KEY`, `AI_MODEL`, and `VISION_MODEL`; these only apply when OpenRouter and Gemini are not configured. `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_API_HOST` are frontend build/runtime values and are not secrets. See the environment examples for defaults and placeholder formats.
 
-Neon is compatible with the SQLAlchemy/psycopg 3 configuration. Put the Neon pooled URL in `backend/.env` as `DATABASE_URL`, retaining TLS, for example:
+## Neon PostgreSQL and Alembic
+
+For direct local backend/Alembic use, put the Neon connection URL only in `backend/.env`, with `sslmode=require`, for example:
 
 ```dotenv
-DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
+DATABASE_URL=postgresql://<user>:<password>@<host>/<database>?sslmode=require
 ```
 
-This is a placeholder format, not a real connection string. The application and Alembic normalize PostgreSQL URLs to the `postgresql+psycopg` driver, use psycopg 3's non-prepared mode, and require TLS for remote PostgreSQL hosts. The existing `vector(1536)` schema is retained. OpenRouter Nemotron embeddings are truncated and normalized to 1536 dimensions, and migration 0007 tags the model space so existing OpenAI vectors are never compared against them. Migration 0008 adds separate workspace consent generations for general external AI and OpenRouter; revocation invalidates any stale in-flight operation before its next provider request. Requests already sent upstream cannot be cancelled. A failed backfill can be resumed by a workspace admin with `POST /api/settings/embeddings/backfill`; no automatic repeat job is scheduled.
-
-With the Python dependencies installed and `backend/.env` configured, run from the repository root:
+This is a placeholder, not a connection credential. SQLAlchemy normalizes PostgreSQL URLs to the installed psycopg 3 driver. Remote PostgreSQL connections require TLS. Migrations are run from the repository root with:
 
 ```powershell
+python -m alembic -c backend/alembic.ini current
 python -m alembic -c backend/alembic.ini upgrade head
 python -m alembic -c backend/alembic.ini current
-python -m alembic -c backend/alembic.ini check
 ```
 
-Migrations create the application schema and pgvector extension. Back up a database before schema changes. Do not point test commands at a production database.
+The checked-in migration head is `0008_consent_generation` after 0007. Back up the intended database before applying migrations and verify the target without printing the URL. Do not use production DATABASE_URL for tests.
 
-## Supabase Storage (S3-compatible)
+## API routes and authentication
 
-The storage adapter supports local files or S3-compatible storage. For the private Supabase bucket, set these values in `backend/.env` for a direct backend process, or root `.env` for Compose:
-
-```dotenv
-STORAGE_BACKEND=s3
-S3_ENDPOINT_URL=https://<project-ref>.storage.supabase.co/storage/v1/s3
-S3_BUCKET=markwise-assets
-S3_REGION=<region-from-supabase-s3-settings>
-S3_ACCESS_KEY_ID=<server-side-access-key-id>
-S3_SECRET_ACCESS_KEY=<server-side-secret-access-key>
-S3_SERVER_SIDE_ENCRYPTION=
-```
-
-Copy the endpoint and region from Supabase Project Settings → Storage → S3. Supabase S3 uses HTTPS, Signature V4, and path-style requests. Its S3 API rejects the SSE request header, so leave `S3_SERVER_SIDE_ENCRYPTION` empty. Keep the bucket private and credentials server-side: generated Supabase S3 credentials bypass bucket RLS. The application currently has no presigned-URL generator or user download route.
-
-To test configured storage, run `python -m backend.app.storage_check` from the repository root. This makes a live upload, authenticated server-side download, anonymous-access denial check, and cleanup of a temporary probe object. It requires valid S3 settings and changes the bucket only by creating and deleting that probe object.
-
-## OpenRouter, Gemini, retrieval, and privacy
-
-OpenRouter is configured as the primary provider for consented workspaces using `nvidia/nemotron-3.5-super-vl:free` for text and image review. It uses the OpenAI-compatible Chat Completions endpoint with a strict JSON schema response and image input. The `nvidia/nemotron-3-ultra-550b-a55b:free` candidate is not used because its current model page says `response_format` JSON enforcement is unsupported. The selected Super VL model documents image input and JSON-schema output ([model capabilities](https://openrouter.ai/nvidia/nemotron-3.5-super-vl:free); [Ultra limitation](https://openrouter.ai/nvidia/nemotron-3-ultra-550b-a55b:free)). Gemini (`gemini-3.5-flash` with `gemini-3.5-flash-lite` alternate) is the secondary provider when configured for both text and vision. Both are supported by Markwise's Interactions API adapter and structured JSON/image paths. Provider/model retries are bounded; quota errors skip same-provider model alternatives, while temporary model errors may advance to a compatible alternate. Circuit cooldown and recovery are retained. If all providers fail, analysis remains incomplete and the existing Knowledge Base fallback is shown; Markwise does not fabricate citations or label that fallback as an AI success.
-
-OpenRouter's free endpoints have changing availability and usage limits. Its current embedding-model page reports volatile provider availability, so semantic search degrades to the existing lexical retrieval if embedding service calls fail. Free provider processing may log prompts and use data to improve services. For that reason, an administrator must first enable external AI and then explicitly enable the separate OpenRouter free-provider consent in workspace settings. The provider explicitly warns not to submit confidential or personal information; do not opt in for such workspace content ([free endpoint terms and data notice](https://openrouter.ai/nvidia/nemotron-3.5-super-vl:free)). With that option off, Markwise uses configured Gemini only. Live AI provider availability and quota depend on the provider account and can change.
-
-Semantic embeddings use `nvidia/nemotron-3.5-embed-1b:free` ([model page](https://openrouter.ai/nvidia/nemotron-3.5-embed-1b:free); [NVIDIA API dimensions and input-type reference](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3_5-embed-1b-infer)) with `input_type=passage` when indexing and `input_type=query` for search. The embedding model is 2048-dimensional; Markwise requests/truncates to 1536 and normalizes the returned vector to preserve the existing PostgreSQL `vector(1536)` schema. Migration 0007 tags each embedding space so old OpenAI vectors are not mixed with new vectors. Opting into OpenRouter queues re-embedding of approved sources; lexical retrieval remains available until indexing completes. Markwise does not call OpenAI embeddings or silently mix embedding models.
-
-## API endpoints and authentication
-
-The API docs at `/docs` expose the OpenAPI schema. AI analysis/retry routes are limited to 10 requests per client IP per minute, and a shared per-process OpenRouter budget defaults to 15 upstream calls/minute across text, vision, retries, and embeddings. Production should add a shared edge/provider limiter across replicas. Main application routes are:
+Protected routes require `Authorization: Bearer <access_token>`. Register at `POST /api/auth/register`; the first account in a new workspace is Admin. Login is `POST /api/auth/login`, current-user details `GET /api/auth/me`. Tokens expire according to `ACCESS_TOKEN_MINUTES` (default 30). See `/docs` for request/response schemas.
 
 | Area | Routes |
 | --- | --- |
-| Health | `GET /health` |
-| Authentication | `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me` |
-| Team | `GET /api/team`, `POST /api/team` |
-| Privacy and provider settings | `GET/PUT /api/settings/privacy`, `GET /api/settings/providers` |
+| Team | `GET/POST /api/team`, `PATCH/DELETE /api/team/{member_id}` |
+| Workspace | `PATCH/DELETE /api/settings/organization` |
+| Privacy/providers | `GET/PUT /api/settings/privacy`, `GET /api/settings/providers`, `POST /api/settings/embeddings/backfill` |
 | Retention | `GET/PUT /api/settings/retention` |
-| Knowledge | `GET/POST /api/knowledge`, `POST /api/knowledge/import`, `POST /api/knowledge/{item_id}/approve` |
-| Reviews | `POST/GET /api/reviews`, `POST /api/reviews/{review_id}/submit`, `/assign`, `/decision`, `GET/POST /api/reviews/{review_id}/comments`, `GET /api/reviews/{review_id}/versions`, `PATCH/DELETE /api/reviews/{review_id}` |
-| Audit and finding decisions | `GET /api/audit-events`, `POST /api/findings/{finding_id}/decision`, `GET /api/findings/{finding_id}/decisions` |
-| Assets and visual reviews | `POST /api/uploads`, `GET/DELETE /api/uploads` (delete includes an asset ID), `POST /api/visual-reviews` |
-| Dashboard | `GET /api/dashboard` |
+| Knowledge | `GET/POST /api/knowledge`, `PATCH/DELETE /api/knowledge/{item_id}`, `POST /api/knowledge/import`, `POST /api/knowledge/{item_id}/approve` |
+| Reviews | `POST/GET /api/reviews`, `POST /api/reviews/{review_id}/retry-ai`, `/submit`, `/assign`, `/decision`, `GET/POST /api/reviews/{review_id}/comments`, `GET /api/reviews/{review_id}/versions`, `PATCH/DELETE /api/reviews/{review_id}` |
+| Findings/history | `POST /api/findings/{finding_id}/decision`, `GET /api/findings/{finding_id}/decisions`, `GET /api/reviews/{review_id}/finding-history` |
+| Audit | `GET /api/audit-events` |
+| Uploads/vision | `POST /api/uploads`, `GET /api/uploads`, `DELETE /api/uploads/{asset_id}`, `POST /api/visual-reviews` |
+| Dashboard/health | `GET /api/dashboard`, `GET /health` |
 
-Register with a workspace name, name, email, and password of at least 12 characters. Registration creates the workspace's first admin account. Login returns a bearer token; send it as `Authorization: Bearer <access_token>` to protected routes. Tokens expire according to `ACCESS_TOKEN_MINUTES` (30 by default). Admins manage workspace knowledge, members, retention, uploads, and provider status; other actions enforce the role rules in the API. The current frontend keeps the token in memory, so reloading the page signs the user out.
+## Tests and production build
 
-## Tests and build
-
-Backend tests use SQLite and mocked AI/S3 adapters. From the repository root, install dev dependencies and explicitly select a test-only database and secret (these PowerShell values exist only in the current terminal):
+Backend tests use SQLite and mocked provider/storage requests. From the repository root, install dev dependencies and explicitly select test-only settings:
 
 ```powershell
 python -m pip install -r backend/requirements-dev.txt
@@ -220,38 +274,36 @@ $env:SECRET_KEY = "local-test-secret-change-this-value-32-chars"
 python -m pytest backend/tests -q
 ```
 
-The backend tests cover API/workflow behavior, workspace isolation, authorization, knowledge confirmation, citation checks and abstention, history/audit, OCR/DOCX, image review, mocked provider failover, mocked S3 behavior, retention, file validation, rate limiting, and 1536-dimensional embedding validation. They do not contact live AI providers, Neon, or Supabase.
-
-Build and run the frontend smoke/accessibility checks from the frontend directory:
+Frontend tests and build, from `frontend/`:
 
 ```powershell
-cd frontend
 npm ci
 npm run build
 npm test
 ```
 
-The Node tests inspect the built production markup and stylesheet for labelled auth controls, a responsive viewport, keyboard focus styling, a skip link, and navigation semantics. They are not browser end-to-end or screen-reader certification tests. The UI tests require the production build to have completed first.
+The build should run before `npm test`, because UI smoke checks inspect production output. Node tests cover selected UI, action, accessibility-markup, and status behavior; they are not full browser end-to-end or screen-reader certification tests. Mocked and SQLite tests do not contact AI providers, Neon, or Supabase.
 
 ## Render deployment
 
-`render.yaml` prepares a Render Blueprint with a Docker FastAPI web service, Docker Next.js web service, and daily retention cron job. It is a deployment configuration, not evidence of a live deployment. No public frontend/backend URL is currently verified.
+`render.yaml` describes a Docker FastAPI web service, Next.js web service, Alembic pre-deploy command, and daily retention cron service. It is configuration, not proof that all services are currently healthy.
 
-1. Connect the intended repository to Render and create the Blueprint from `render.yaml`.
-2. Set protected service values for Neon `DATABASE_URL` (with `sslmode=require` and `vector` enabled), Supabase S3 endpoint/bucket/region/access keys, `OPENROUTER_API_KEY`, and optional Gemini `GEMINI_API_KEY`. Gemini defaults to `gemini-3.5-flash` for text and vision with `gemini-3.5-flash-lite` alternates. Render generates `SECRET_KEY`; do not put secrets in the repository or frontend settings.
-3. Confirm the backend `CORS_ORIGINS` exactly matches the actual HTTPS frontend origin. The Blueprint currently contains an example Render hostname; update it if Render assigns a different host. Verify the frontend's `NEXT_PUBLIC_API_HOST`/API URL points to the actual backend host.
-4. Deploy and inspect the build, Alembic pre-deploy migration, API `/health`, frontend HTTPS response, and cron logs. Verify the retention worker receives the required database and S3 settings.
-5. Use a dedicated test workspace to verify registration/login, role restrictions and workspace boundaries, private upload, admin-confirmed guideline import, AI consent, real analysis/citations, review decisions/history, dashboard data, retention deletion, and CORS. Run edge-level shared rate limiting, monitoring, backups, and HTTPS checks before inviting users.
+1. Connect the repository in Render and review Blueprint service plans.
+2. Set protected backend values for Neon `DATABASE_URL` with TLS, Supabase S3 endpoint/bucket/region/access keys, `OPENROUTER_API_KEY`, and optional `GEMINI_API_KEY`. Render generates `SECRET_KEY`.
+3. Set backend `CORS_ORIGINS` to the exact frontend HTTPS origin. Verify frontend `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_API_HOST` points to the backend service.
+4. Confirm migration output, `/health`, frontend HTTPS response, and retention cron logs.
+5. Verify registration/login, consent, private upload, guideline confirmation, AI analysis/citations, role boundaries, finding decisions/history, dashboard data, CORS, retention, monitoring, and backups in a dedicated test workspace.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed external-service setup and release checks. Render authorization, production service startup, live AI workflow, scheduled purge, and public URLs must be verified in the target accounts; do not treat the Blueprint hostname as a live URL.
+Markwise is already deployed and running. For access to the live application or backend URLs, please contact the project owner. This documentation update did not probe the live deployment. Detailed release steps and limitations are in [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Security, known limitations, and demo
 
-- Passwords are hashed with PBKDF2-HMAC-SHA256 and per-account random salts. Bearer tokens expire, routes check workspace ownership and roles, and the backend adds basic response security headers.
-- Rate limits are in-process, so multiple production replicas need a shared ingress/edge rate limiter. Token storage is in browser memory. Email invitations, account recovery, and CSRF-safe cookie/refresh-token flows are not implemented.
-- External AI is workspace opt-in, but opted-in draft/image content and retrieved approved sources are sent to configured providers. Configure provider privacy and data-retention settings before use. AI findings still require human review.
-- OCR contrast and image/logo checks are heuristic. Markwise does not guarantee full WCAG conformance, exact logo identity, or automated publication approval.
-- Supabase server-side S3 credentials bypass bucket RLS. Keep the bucket private and keys server-only. Review retention values before enabling automatic purge; `0` means no automatic expiry.
-- A complete production security review, browser end-to-end workflow, shared rate-limit service, monitoring/alerting, backup-restore drill, Docker Compose runtime, and Render deployment remain unverified. Check [PROJECT_STATUS.md](PROJECT_STATUS.md) and [TODO.md](TODO.md) before relying on an item as complete.
+- Passwords use PBKDF2-HMAC-SHA256 with per-account salts; bearer tokens expire; backend routes enforce roles and workspace scope.
+- The frontend keeps the access token in React memory, not persistent storage; a page refresh signs the user out. Invitations, password recovery, and a refresh-token/cookie session flow are not implemented.
+- Rate limits are process-local and do not aggregate across workers/instances. Add edge/shared limits before scaling.
+- External providers receive opted-in draft/image content and retrieved approved passages. OpenRouter free inputs may be logged/used for provider improvement; do not consent for sensitive data.
+- OCR, contrast, palette, and logo checks are heuristic. No formal WCAG certification or exact logo identity guarantee is provided.
+- S3 keys are server-only; Supabase S3 keys bypass bucket RLS, so keep the bucket private. Retention value `0` means no automatic expiry.
+- Full browser E2E/accessibility review, shared rate limits, Docker runtime verification, and production monitoring/backup drills remain incomplete or unverified. Compose runtime and live provider quotas depend on local tools/accounts.
 
-**Screenshots/demo:** No screenshots are currently checked into the repository, and no public demo URL has been verified. Run the local application using the steps above; use `/docs` to inspect the API.
+**Demo/screenshots:** No screenshots are checked into the repository. Markwise is already deployed and running; contact the project owner for live application or backend URLs.

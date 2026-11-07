@@ -10,3 +10,7 @@ export function canApplyFindingSuggestion(finding, content, channel) {
   if (finding.kind === "cannot_verify" && GENERIC_CANNOT_VERIFY_SUGGESTIONS.has(finding.suggestion.trim().toLowerCase())) return false;
   return content.includes(finding.excerpt) && content.indexOf(finding.excerpt) === content.lastIndexOf(finding.excerpt);
 }
+
+export function isActiveFinding(finding) {
+  return !["stale", "accepted", "dismissed", "applied", "resolved"].includes(finding.status);
+}
