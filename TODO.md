@@ -8,7 +8,7 @@ Items are marked done only to the level tested locally. External-service and pub
 
 - [x] Consent-gated OpenRouter free text/vision adapter with Gemini secondary, source grounding, citations, CANNOT VERIFY, and guarded suggestions. OpenAI is not called by the configured free stack.
 - [x] Bounded 429/quota/5xx/timeout/connection retries, exponential jitter with Retry-After, provider circuit cooldown/recovery, capability-aware image failover, safe logs, and admin-visible provider status.
-- [x] Model order: OpenRouter `nvidia/nemotron-3.5-super-vl:free` → Gemini `gemini-3.8-flash` / `gemini-3.7-flash`. HTTP 429/quota skips same-provider alternates; temporary model errors use only compatible model alternatives.
+- [x] Model order: OpenRouter `nvidia/nemotron-3.5-super-vl:free` → Gemini `gemini-3.5-flash` / `gemini-3.5-flash-lite`. HTTP 429/quota skips same-provider alternates; temporary model errors use only compatible model alternatives.
 - [x] Mock tests cover OpenRouter text/vision strict JSON, model capability guard, embeddings, 1536 dimensions, workspace cache scope/revocation, OpenRouter quota-to-Gemini, and existing bounded retry/circuit behavior.
 - [x] Use OpenRouter Nemotron Embed requested at 1536 dimensions; preserve the pgvector schema and tag model spaces with forward migration 0007. Existing OpenAI vectors are ignored and re-embedded only after explicit workspace consent.
 - [x] Approved-source chunking, pgvector cosine retrieval, lexical fallback, embedding backfill, and cleanup on consent withdrawal.

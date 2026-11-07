@@ -67,10 +67,10 @@ def test_provider_error_logs_diagnostic_fields_without_upstream_message_or_secre
     monkeypatch.setattr(ai.httpx, "post", Mock(return_value=response))
     with pytest.raises(ai.ProviderRequestError):
         ai._request("gemini", "https://example.invalid", headers={}, payload={}, timeout=1,
-                    model="gemini-3.8-flash", operation="analyse")
+                    model="gemini-3.5-flash", operation="analyse")
     output = caplog.text
     assert "provider=gemini" in output
-    assert "model=gemini-3.8-flash" in output
+    assert "model=gemini-3.5-flash" in output
     assert "operation=analyse" in output
     assert f"status={status}" in output
     assert f"error_code={code}" in output
@@ -90,22 +90,36 @@ def test_gemini_text_and_image_requests_preserve_schema_context(monkeypatch):
         response.json.return_value = payload
         return response
     monkeypatch.setattr(ai.httpx, "post", fake_post)
-    provider = ai.GeminiProvider(Settings(gemini_api_key="private-test", gemini_text_model="text-test",
-                                          gemini_vision_model="vision-test"), consent_guard=lambda: None)
+    provider = ai.GeminiProvider(Settings(
+        gemini_api_key="private-test",
+        gemini_text_model="gemini-3.5-flash",
+        gemini_text_model_alternate="gemini-3.5-flash-lite",
+        gemini_vision_model="gemini-3.5-flash",
+        gemini_vision_model_alternate="gemini-3.5-flash-lite",
+    ), consent_guard=lambda: None)
     source = Mock(id=8, kind="rule", title="Tone", body="Use clear wording", source="Guide", passage="Be clear", version=2)
     assert provider.analyse("Draft", {"goal": "inform"}, [source]).findings == []
     assert provider.analyse_image(b"pixels", "image/png", {"role": "logo"}, [source], b"reference").findings == []
-    text_request, image_request = captured
+    assert provider.analyse("Draft", {"goal": "inform"}, [source], model="gemini-3.5-flash-lite").findings == []
+    assert provider.analyse_image(b"pixels", "image/png", {"role": "logo"}, [source], b"reference",
+                                  model="gemini-3.5-flash-lite").findings == []
+    text_request, image_request, alternate_text_request, alternate_image_request = captured
     assert text_request[0].endswith("/v1beta/interactions")
-    assert text_request[2]["model"] == "text-test"
+    assert text_request[2]["model"] == "gemini-3.5-flash"
     assert text_request[2]["store"] is False
     assert text_request[1]["x-goog-api-key"] == "private-test"
     assert text_request[2]["response_format"]["mime_type"] == "application/json"
     assert "approved_sources" in text_request[2]["input"][0]["text"]
-    assert image_request[2]["model"] == "vision-test"
+    assert image_request[2]["model"] == "gemini-3.5-flash"
+    assert alternate_text_request[2]["model"] == "gemini-3.5-flash-lite"
+    assert alternate_image_request[2]["model"] == "gemini-3.5-flash-lite"
+    assert all(request[2]["response_format"]["mime_type"] == "application/json" for request in captured)
     parts = image_request[2]["input"]
     assert [part["data"] for part in parts[1:]] == ["cGl4ZWxz", "cmVmZXJlbmNl"]
-    assert all(part["type"] == "image" for part in parts[1:])
+    alternate_parts = alternate_image_request[2]["input"]
+    assert [part["data"] for part in alternate_parts[1:]] == ["cGl4ZWxz", "cmVmZXJlbmNl"]
+    assert all(part["type"] == "image" for request in (image_request, alternate_image_request)
+               for part in request[2]["input"][1:])
 
 
 def test_gemini_incomplete_interaction_logs_safe_failure_metadata(monkeypatch, caplog):
@@ -118,10 +132,10 @@ def test_gemini_incomplete_interaction_logs_safe_failure_metadata(monkeypatch, c
         return response
 
     monkeypatch.setattr(ai.httpx, "post", fake_post)
-    provider = ai.GeminiProvider(Settings(gemini_api_key="not-logged", gemini_text_model="gemini-3.8-flash"), consent_guard=lambda: None)
+    provider = ai.GeminiProvider(Settings(gemini_api_key="not-logged", gemini_text_model="gemini-3.5-flash"), consent_guard=lambda: None)
     with pytest.raises(ai.ProviderRequestError):
         provider.analyse("private submitted text", {}, [])
-    assert "model=gemini-3.8-flash" in caplog.text
+    assert "model=gemini-3.5-flash" in caplog.text
     assert "operation=analyse" in caplog.text
     assert "status=failed" in caplog.text
     assert "error_code=INTERNAL_ERROR" in caplog.text
@@ -173,7 +187,7 @@ def test_transient_openrouter_failure_falls_back_to_gemini_and_opens_circuit(mon
     class Fallback:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash"]
         def supports_model(self, model, method): return True
         def analyse(self, *_, model=None): return ai.AnalysisResponse(findings=[])
     monkeypatch.setattr(ai, "OpenRouterProvider", Primary)
@@ -201,7 +215,7 @@ def test_retries_are_bounded_exponential_jittered_and_honor_retry_after(monkeypa
     provider = Unstable(config)
     wrapper = ai.FailoverProvider(config)
     with pytest.raises(ai.ProviderRequestError):
-        wrapper._attempt_provider_model(provider, "analyse", ("draft", {}, []), "gemini-3.8-flash")
+        wrapper._attempt_provider_model(provider, "analyse", ("draft", {}, []), "gemini-3.5-flash")
     assert provider.calls == 3
     assert delays == [2, 2]
 
@@ -222,7 +236,7 @@ def test_bounded_provider_retry_can_recover_on_the_same_analysis_request(monkeyp
             return ai.AnalysisResponse(findings=[])
 
     provider = FlakyProvider(config)
-    result = ai.FailoverProvider(config)._attempt_provider_model(provider, "analyse", ("draft", {}, []), "gemini-3.8-flash")
+    result = ai.FailoverProvider(config)._attempt_provider_model(provider, "analyse", ("draft", {}, []), "gemini-3.5-flash")
     assert result.findings == []
     assert provider.calls == 2
 
@@ -243,7 +257,7 @@ def test_openrouter_recovers_after_cooldown_and_becomes_active(monkeypatch):
     class Fallback:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash"]
         def supports_model(self, model, method): return True
         def analyse(self, *_, model=None): calls["fallback"] += 1; return ai.AnalysisResponse(findings=[])
     monkeypatch.setattr(ai, "OpenRouterProvider", Primary)
@@ -279,7 +293,7 @@ def test_all_providers_down_returns_retryable_user_message(monkeypatch):
     class Down:
         capabilities = {"text", "vision"}
         def __init__(self, *_args, **_kwargs): pass
-        def models_for(self, method): return ["gemini-3.8-flash", "gemini-3.7-flash"] if self.name == "gemini" else ["gpt-6-luna", "gpt-5.6-luna"]
+        def models_for(self, method): return ["gemini-3.5-flash", "gemini-3.5-flash-lite"] if self.name == "gemini" else ["gpt-6-luna", "gpt-5.6-luna"]
         def supports_model(self, model, method): return True
         def analyse(self, *_, model=None): raise ai.ProviderRequestError(self.name, "temporary failure", True)
 
@@ -296,7 +310,7 @@ def test_vision_never_falls_back_to_text_only(monkeypatch):
     class Primary:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash"]
         def supports_model(self, model, method): return True
         def analyse_image(self, *_, model=None): raise ai.ProviderRequestError("gemini", "temporary", True)
     class TextOnly:
@@ -319,11 +333,11 @@ def test_gemini_primary_503_uses_gemini_alternate(monkeypatch):
     class Gemini:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash", "gemini-3.7-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
         def supports_model(self, model, method): return True
         def analyse(self, *args, model=None):
             attempts.append(("gemini", model))
-            if model == "gemini-3.8-flash":
+            if model == "gemini-3.5-flash":
                 raise ai.ProviderRequestError("gemini", "temporary model error", True)
             return ai.AnalysisResponse(findings=[])
 
@@ -338,12 +352,29 @@ def test_gemini_primary_503_uses_gemini_alternate(monkeypatch):
     monkeypatch.setattr(ai, "OpenAICompatibleProvider", OpenAI)
     result = ai.FailoverProvider(config).analyse("draft", {}, [])
     assert result.findings == []
-    assert attempts == [("gemini", "gemini-3.8-flash"), ("gemini", "gemini-3.7-flash")]
+    assert attempts == [("gemini", "gemini-3.5-flash"), ("gemini", "gemini-3.5-flash-lite")]
 
 
-def test_selected_models_are_vision_and_structured_output_capable_and_fail_closed():
-    for model in ("gemini-3.8-flash", "gemini-3.7-flash"):
+def test_gemini_configuration_uses_only_approved_models_for_text_vision_and_json():
+    primary = "gemini-3.5-flash"
+    alternate = "gemini-3.5-flash-lite"
+    assert Settings.model_fields["gemini_text_model"].default == primary
+    assert Settings.model_fields["gemini_vision_model"].default == primary
+    assert Settings.model_fields["gemini_text_model_alternate"].default == alternate
+    assert Settings.model_fields["gemini_vision_model_alternate"].default == alternate
+    provider = ai.GeminiProvider(Settings(
+        gemini_text_model=primary,
+        gemini_text_model_alternate=alternate,
+        gemini_vision_model=primary,
+        gemini_vision_model_alternate=alternate,
+    ), consent_guard=lambda: None)
+    assert provider.models_for("analyse") == [primary, alternate]
+    assert provider.models_for("analyse_image") == [primary, alternate]
+    for model in (primary, alternate):
         assert ai.GeminiProvider.supports_model(model, "analyse_image")
+        assert ai.GeminiProvider.supports_model(model, "analyse")
+    for model in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"):
+        assert not ai.GeminiProvider.supports_model(model, "analyse")
     for model in ("gpt-6-luna", "gpt-5.6-luna"):
         assert ai.OpenAICompatibleProvider.supports_model(model, "analyse_image")
     assert not ai.OpenAICompatibleProvider.supports_model("gpt-text-only", "analyse_image")
@@ -364,7 +395,7 @@ def test_mocked_vision_provider_quota_falls_back_to_gemini(monkeypatch):
     class Gemini:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash", "gemini-3.7-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
         def supports_model(self, model, method): return True
         def analyse_image(self, *args, model=None):
             calls.append(("gemini", model))
@@ -373,7 +404,7 @@ def test_mocked_vision_provider_quota_falls_back_to_gemini(monkeypatch):
     monkeypatch.setattr(ai, "GeminiProvider", Gemini)
     result=ai.FailoverProvider(config, allow_openrouter=True).analyse_image(b"image", "image/png", {}, [])
     assert result.findings == []
-    assert calls == [("openrouter", "nvidia/nemotron-3.5-super-vl:free"), ("gemini", "gemini-3.8-flash")]
+    assert calls == [("openrouter", "nvidia/nemotron-3.5-super-vl:free"), ("gemini", "gemini-3.5-flash")]
 
 
 def test_openrouter_text_uses_verified_model_and_strict_json_schema(monkeypatch):
@@ -456,7 +487,7 @@ def test_openrouter_quota_switches_to_gemini_without_openai_or_model_repeat(monk
     class Gemini:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash", "gemini-3.7-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
         def supports_model(self, model, method): return True
         def analyse(self, *args, model=None):
             calls.append(("gemini", model))
@@ -466,7 +497,7 @@ def test_openrouter_quota_switches_to_gemini_without_openai_or_model_repeat(monk
     monkeypatch.setattr(ai, "GeminiProvider", Gemini)
     result = ai.provider_from_config(config, allow_openrouter=True).analyse("draft", {}, [])
     assert result.findings == []
-    assert calls == [("openrouter", "nvidia/nemotron-3.5-super-vl:free"), ("gemini", "gemini-3.8-flash")]
+    assert calls == [("openrouter", "nvidia/nemotron-3.5-super-vl:free"), ("gemini", "gemini-3.5-flash")]
 
 
 def test_openrouter_is_not_called_without_workspace_consent(monkeypatch):
@@ -476,7 +507,7 @@ def test_openrouter_is_not_called_without_workspace_consent(monkeypatch):
     class Gemini:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash", "gemini-3.7-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
         def supports_model(self, model, method): return True
         def analyse(self, *args, model=None):
             calls.append(("gemini", model))
@@ -485,7 +516,7 @@ def test_openrouter_is_not_called_without_workspace_consent(monkeypatch):
     monkeypatch.setattr(ai, "GeminiProvider", Gemini)
     provider = ai.provider_from_config(config, allow_openrouter=False)
     assert provider.analyse("draft", {}, []).findings == []
-    assert calls == [("gemini", "gemini-3.8-flash")]
+    assert calls == [("gemini", "gemini-3.5-flash")]
 
 
 def test_query_embedding_cache_is_workspace_and_model_scoped_and_revocable(monkeypatch):
@@ -555,7 +586,7 @@ def test_consent_withdrawal_after_primary_failure_blocks_gemini_fallback(monkeyp
     class Gemini:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash"]
         def supports_model(self, model, method): return True
         def analyse(self, *args, model=None):
             calls.append("gemini")
@@ -601,7 +632,7 @@ def test_openrouter_opt_out_allows_only_consented_gemini_fallback(monkeypatch):
     class Gemini:
         name = "gemini"; capabilities = {"text", "vision"}
         def __init__(self, _): pass
-        def models_for(self, method): return ["gemini-3.8-flash"]
+        def models_for(self, method): return ["gemini-3.5-flash"]
         def supports_model(self, model, method): return True
         def analyse(self, *args, model=None):
             calls.append("gemini")

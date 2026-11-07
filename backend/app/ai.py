@@ -176,7 +176,9 @@ def _prompts(content: str, context: dict, sources: list[Knowledge], visual: bool
             "Review the supplied image only against the provided approved workspace sources and declared intent. "
             "Never invent rules, source IDs, contrast measurements, or logo requirements. Each finding must cite an approved source ID. "
             "Use exact visible text or a region in the form 'Image region x=0 y=0 width=1 height=1'. "
-            "Abstain on claims when evidence is insufficient. Preserve meaning in any suggested rewrite. Return JSON only matching: "
+            "For every actionable finding, provide a concrete, contextual replacement for only the quoted excerpt; never return advice such as 'check a source' as the rewrite. "
+            "Preserve the draft's tone and communication goal. If a factual claim cannot be verified, keep cannot_verify=true and offer a safe alternative that removes or clearly qualifies the unsupported assertion without adding facts, figures, guarantees, or other claims. "
+            "If no safe replacement is possible, return null. Generating a rewrite does not resolve the finding. Return JSON only matching: "
             + json.dumps(schema)
         )
         user = {"context": context, "approved_sources": _source_context(sources), "draft": content[:50000]}
@@ -186,7 +188,8 @@ def _prompts(content: str, context: dict, sources: list[Knowledge], visual: bool
             "Never invent a rule, fact, source, quotation, or citation. Every finding must quote an exact substring from the draft. "
             "For claims, cite relevant approved fact IDs only; if evidence is absent, contradictory, or insufficient, set cannot_verify=true, "
             "leave cited_source_ids empty, and do not guess. For rule findings, cite relevant approved rule IDs. Do not flag style or dialect "
-            "unless an approved rule supports it. Suggested rewrites must change only the excerpt and preserve its intended meaning; set "
+            "unless an approved rule supports it. For every actionable finding, provide a concrete contextual replacement for only the excerpt, not generic advice. "
+            "Preserve the draft's tone and communication goal. If a factual claim cannot be verified, keep cannot_verify=true and make the alternative remove or clearly qualify the unsupported assertion without adding facts, figures, guarantees, or other claims. If no safe replacement is possible, return null. Generating a rewrite does not resolve the finding. Set "
             "intent_preserved=true only when genuinely satisfied. Return JSON only matching: " + json.dumps(schema)
         )
         user = {"draft": content[:50000], "intent": context, "approved_sources": _source_context(sources)}
@@ -478,8 +481,9 @@ class GeminiProvider:
 
     @staticmethod
     def supports_model(model: str, method: str) -> bool:
-        # Both selected Gemini models support text, image input and structured output.
-        return model in {"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"}
+        # Keep this list explicit: only models verified for Markwise text,
+        # image input and structured JSON output may be selected for either path.
+        return model in {"gemini-3.5-flash", "gemini-3.5-flash-lite"}
 
     @staticmethod
     def _response_schema(openai: bool = False) -> dict:

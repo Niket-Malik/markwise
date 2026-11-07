@@ -63,10 +63,10 @@ class Settings(BaseSettings):
     embedding_model: str = "nvidia/nemotron-3.5-embed-1b:free"
     embedding_dimensions: int = 1536
     gemini_api_key: str = ""
-    gemini_text_model: str = "gemini-3.8-flash"
-    gemini_vision_model: str = "gemini-3.8-flash"
-    gemini_text_model_alternate: str = "gemini-3.7-flash"
-    gemini_vision_model_alternate: str = "gemini-3.7-flash"
+    gemini_text_model: str = "gemini-3.5-flash"
+    gemini_vision_model: str = "gemini-3.5-flash"
+    gemini_text_model_alternate: str = "gemini-3.5-flash-lite"
+    gemini_vision_model_alternate: str = "gemini-3.5-flash-lite"
     ai_fallback_provider: str = "openai_compatible"
     ai_fallback_api_base_url: str = "https://api.openai.com/v1"
     ai_fallback_api_key: str = ""
@@ -965,6 +965,21 @@ def analyse_unsupported_factual_claims(content: str, knowledge: list[Knowledge],
     return findings
 
 
+def _validated_ai_rewrite(excerpt: str, candidate, sources: list[Knowledge], *, unverified_claim: bool = False) -> str:
+    rewrite = (candidate.suggested_rewrite or "").strip()
+    if not rewrite or not candidate.intent_preserved or len(rewrite) > max(240, len(excerpt) * 4):
+        return ""
+    proposed_numbers = set(re.findall(r"\d+(?:\.\d+)?\s*%?", rewrite))
+    if candidate.cannot_verify or unverified_claim:
+        # With no validated fact, any numerical detail could repeat an
+        # unsupported claim or introduce a new one.
+        return rewrite if not proposed_numbers else ""
+    supported_numbers = set(re.findall(r"\d+(?:\.\d+)?\s*%?", excerpt))
+    for source in sources:
+        supported_numbers.update(re.findall(r"\d+(?:\.\d+)?\s*%?", source.body + " " + source.passage))
+    return rewrite if proposed_numbers <= supported_numbers else ""
+
+
 def validate_ai_findings(content: str, candidates, retrieved: list[Knowledge], existing: list[dict], image_dimensions: tuple[int, int] | None = None) -> list[dict]:
     """Accept only exact draft spans and citations from the retrieved, active workspace set."""
     allowed = {source.id: source for source in retrieved if source.status == "active"}
@@ -984,15 +999,20 @@ def validate_ai_findings(content: str, candidates, retrieved: list[Knowledge], e
         has_unretrieved_ids = bool(source_ids - set(allowed))
         if candidate.kind == "claim" and (candidate.cannot_verify or has_unretrieved_ids or not sources or not any(source.kind == "fact" for source in sources)):
             key = ("cannot_verify", excerpt)
+            suggestion = _validated_ai_rewrite(excerpt, candidate, sources, unverified_claim=True)
             if key not in existing_pairs:
                 findings.append({
                     "kind": "cannot_verify", "excerpt": excerpt,
                     "explanation": "No matching approved fact could be validated for this claim. Marked CANNOT VERIFY instead of guessing.",
                     "severity": "high", "confidence": candidate.confidence,
                     "citation": "No matching active approved fact was validated in the retrieved workspace sources.",
-                    "suggestion": "Confirm this claim with an approved source before publication.",
+                    "suggestion": suggestion,
                 })
                 existing_pairs.add(key)
+            else:
+                prior = next((item for item in existing if item["kind"] == "cannot_verify" and item["excerpt"] == excerpt), None)
+                if prior and suggestion:
+                    prior["suggestion"] = suggestion
             continue
         if candidate.cannot_verify or has_unretrieved_ids or not sources:
             continue
@@ -1004,15 +1024,7 @@ def validate_ai_findings(content: str, candidates, retrieved: list[Knowledge], e
         for source in sources:
             passage = source.passage.strip() or source.body.strip()
             citations.append(f"{source.kind.upper()} #{source.id} — {source.source}, {source.title}, v{source.version}: ‘{passage}’")
-        suggestion = ""
-        rewrite = candidate.suggested_rewrite
-        if rewrite and candidate.intent_preserved:
-            proposed_numbers = set(re.findall(r"\d+(?:\.\d+)?\s*%?", rewrite))
-            supported_numbers = set(re.findall(r"\d+(?:\.\d+)?\s*%?", excerpt))
-            for source in sources:
-                supported_numbers.update(re.findall(r"\d+(?:\.\d+)?\s*%?", source.body + " " + source.passage))
-            if proposed_numbers <= supported_numbers and len(rewrite) <= max(240, len(excerpt) * 4):
-                suggestion = rewrite
+        suggestion = _validated_ai_rewrite(excerpt, candidate, sources)
         if key in existing_pairs:
             prior = next((item for item in existing if item["kind"] == finding_kind and item["excerpt"] == excerpt), None)
             if prior and suggestion:
@@ -1415,14 +1427,17 @@ def finding_decision(finding_id: int, data: dict, user: User = Depends(current_u
         raise HTTPException(422, "Add a short reason for editing, dismissing, or rejecting this finding")
     if not isinstance(reason, str) or len(reason) > 2000:
         raise HTTPException(422, "Decision reason is limited to 2,000 characters")
-    finding.status = decision
-    if decision == "edited" and isinstance(data.get("suggestion"), str):
-        finding.suggestion = data["suggestion"][:12000]
     if decision == "accepted":
-        if review.channel == "Image" or finding.kind == "cannot_verify" or not finding.kind.startswith("ai_") and finding.kind != "claim":
+        if review.channel == "Image" or not finding.kind.startswith("ai_") and finding.kind not in {"claim", "cannot_verify"}:
             raise HTTPException(422, "This finding is guidance only and has no applicable text rewrite")
         if not finding.suggestion.strip() or finding.excerpt not in review.content:
             raise HTTPException(422, "There is no validated rewrite span to apply in this draft")
+        if finding.kind == "cannot_verify" and finding.suggestion.strip().casefold() in {
+            "confirm this claim with an approved source before publication.",
+            "confirm this statement with an approved source before publication.",
+            "confirm this figure with an approved source before publication.",
+        }:
+            raise HTTPException(422, "This CANNOT VERIFY finding has no safe replacement yet. Edit the suggestion before applying it.")
         if review.content.count(finding.excerpt) != 1:
             raise HTTPException(409, "This wording appears more than once; edit the draft and review it again to avoid changing the wrong span")
         span_end = review.content.index(finding.excerpt) + len(finding.excerpt)
@@ -1432,6 +1447,7 @@ def finding_decision(finding_id: int, data: dict, user: User = Depends(current_u
         updated_content = review.content.replace(finding.excerpt, rewrite, 1)
         if updated_content == review.content:
             raise HTTPException(422, "The suggested wording does not change this draft")
+        finding.status = decision
         review.content = updated_content
         db.add(ReviewVersion(organization_id=user.organization_id, review_id=review.id, user_id=user.id, content=updated_content))
         for previous in review.findings:
@@ -1441,6 +1457,10 @@ def finding_decision(finding_id: int, data: dict, user: User = Depends(current_u
         for finding_data in new_findings:
             db.add(Finding(review_id=review.id, **finding_data))
         review.status = review_workflow_status(review.ai_status, new_findings)
+    else:
+        finding.status = decision
+        if decision == "edited" and isinstance(data.get("suggestion"), str):
+            finding.suggestion = data["suggestion"][:12000]
     db.add(FindingDecision(organization_id=user.organization_id, finding_id=finding.id, user_id=user.id, decision=decision, reason=reason.strip()))
     audit(db, user, f"finding.{decision}", "finding", finding.id); db.commit()
     return {"id": finding.id, "status": decision, "suggestion": finding.suggestion, "reason": reason.strip(), "content_updated": decision == "accepted"}

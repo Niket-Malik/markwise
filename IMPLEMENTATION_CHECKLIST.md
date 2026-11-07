@@ -5,7 +5,7 @@
 - [x] Text and image review, with findings persisted to workspace-scoped reviews.
 - [x] Admin-confirmed and versioned knowledge entries; PDF/DOCX import creates pending passages.
 - [x] AI-assisted text/vision analysis is opt-in; evidence is drawn from approved source retrieval and citation checked. `CANNOT VERIFY` is used where supported facts are absent.
-- [x] OpenRouter `nvidia/nemotron-3.5-super-vl:free` handles consented text, vision and JSON-schema analysis; Gemini `gemini-3.8-flash` → `gemini-3.7-flash` is the secondary. Bounded retries, quota-aware failover, circuit recovery and capability checks are retained.
+- [x] OpenRouter `nvidia/nemotron-3.5-super-vl:free` handles consented text, vision and JSON-schema analysis; Gemini `gemini-3.5-flash` → `gemini-3.5-flash-lite` is the secondary. Bounded retries, quota-aware failover, circuit recovery and capability checks are retained.
 - [x] OpenRouter `nvidia/nemotron-3.5-embed-1b:free` adapter requests and validates 1536-dimensional vectors (mock-verified, not live-verified). Migration 0007 tags embedding space; existing pgvector dimension is unchanged and prior embeddings are excluded until re-indexed.
 - [x] AI failover unit tests cover provider error classification, retry bounds, fallback, permanent errors, recovery, visual capability, and total outage.
 - [x] Human decisions, override reasons, comments, assignments, content versions, and audit history are persisted.
